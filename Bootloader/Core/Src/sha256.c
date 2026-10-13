@@ -124,11 +124,13 @@ void sha256_final(SHA256_CTX *ctx, uint8_t hash[SHA256_DIGEST_SIZE])
 	}
 	sha256_transform(ctx, ctx->data);
 
-	for(i = 0; i < 4; ++i)
+	/* Serialize the 8 state words big-endian: word i contributes 4 bytes,
+	 * shifts 24/16/8/0 only - a negative shift count is undefined behavior. */
+	for(i = 0; i < 8; ++i)
 	{
-		for(j = 0; j < 8; ++j)
+		for(j = 0; j < 4; ++j)
 		{
-			hash[i * 8 + j] = (uint8_t)((ctx->state[i] >> (24 - 8 * j)) & 0xFF);
+			hash[i * 4 + j] = (uint8_t)((ctx->state[i] >> (24 - 8 * j)) & 0xFF);
 		}
 	}
 }

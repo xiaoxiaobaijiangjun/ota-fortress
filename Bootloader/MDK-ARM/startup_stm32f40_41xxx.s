@@ -38,7 +38,9 @@
 ;   <o> Stack Size (in Bytes) <0x0-0xFFFFFFFF:8>
 ; </h>
 
-Stack_Size      EQU     0x00000400
+; uECC_verify (ECDSA-P256) needs ~2 KB of stack; 0x400 let the stack
+; overrun into .bss globals (huart1, pFlash) and silently kill UART TX.
+Stack_Size      EQU     0x00001000
 
                 AREA    STACK, NOINIT, READWRITE, ALIGN=3
 Stack_Mem       SPACE   Stack_Size

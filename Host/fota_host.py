@@ -273,7 +273,10 @@ class CanBridgeTransport:
     def __init__(self, port: str, baud: int):
         import serial
 
-        self.ser = serial.Serial(port, baud, timeout=0.5)
+        # 20 ms: on Windows pyserial read() waits out the full timeout to
+        # collect requested bytes, so a long timeout here delays every FC
+        # round trip past the MCU's 500 ms ISO-TP reassembly timeout.
+        self.ser = serial.Serial(port, baud, timeout=0.02)
         self.ser.reset_input_buffer()
         self.ser.reset_output_buffer()
         time.sleep(0.1)
@@ -295,6 +298,12 @@ class CanBridgeTransport:
         return head + struct.pack("<I", crc32_fota(head))
 
     def _send_frame(self, frame: bytes) -> None:
+        # The MCU services the injected frame synchronously (CAN round trip
+        # + reply forward = ~1.5 ms with the UART busy transmitting). Its
+        # UART has a 1-byte-deep DR: bytes arriving while it is not in the
+        # fetch loop overrun and are lost. Pace every inject so the MCU is
+        # always back in the fetch loop when the next frame starts.
+        time.sleep(0.006)
         self.ser.write(self._tunnel_packet(0x1C, frame))
         self.ser.flush()
 
@@ -331,7 +340,9 @@ class CanBridgeTransport:
     def _wait_fc(self, deadline_s: float = 2.0):
         """Wait for the MCU's flow-control frame (forwarded on the tunnel)."""
         self._rx.last_fc = None
-        self._pump(deadline_s)
+        end = time.time() + deadline_s
+        while self._rx.last_fc is None and time.time() < end:
+            self._pump(0.05)
         if self._rx.last_fc is None:
             raise RuntimeError("timeout waiting for CAN flow control frame")
         fc = self._rx.last_fc
@@ -746,7 +757,28 @@ class FOTAClient:
         if not ok:
             return f"Activate Refused: {why}"
         packet = activate_cmd(slot, len(fw.image), crc32_fota(fw.image))
-        reply = self._send_with_logs(packet, 1)
+        if isinstance(self.t, CanBridgeTransport):
+            # CAN-bridge special case: the success reply byte's loopback
+            # echo strands in the CAN FIFO (the app jump happens inside the
+            # dispatch, before the service loop could forward it), and the
+            # [BL] success log would need an FC frame the host never sends.
+            # Judge success by the app banner appearing on the serial line.
+            try:
+                reply = self._send_with_logs(packet, 1)
+            except RuntimeError:
+                # The banner arrives as RAW serial text (the app owns the
+                # UART after the jump), not as tunnel frames: read the wire.
+                end = time.time() + 7.0
+                blob = b""
+                while time.time() < end:
+                    blob += self.t.ser.read(256)
+                if b"[FOTA APP]" in blob:
+                    sys.stdout.write(blob.decode("ascii", errors="replace"))
+                    sys.stdout.flush()
+                    return "Activate Success (CAN bridge: app banner observed, jumping...)"
+                raise
+        else:
+            reply = self._send_with_logs(packet, 1)
         if reply[0] == NACK:
             return "NACK"
         if reply[0] == 0x01:
@@ -781,6 +813,15 @@ class FOTAClient:
                     pass
             finally:
                 self.t.ser.timeout = old_timeout
+        elif isinstance(self.t, CanBridgeTransport):
+            # Over the CAN tunnel the reset may emit a NACK (already in the
+            # bootloader) or the app banner; either would desync the tunnel
+            # parser, which only understands [len][0x1C/0x1D][frame][crc32]
+            # packets. Drain the wire and drop any half-parsed state.
+            time.sleep(0.3)
+            self.t.ser.reset_input_buffer()
+            self.t._buf.clear()
+            self.t._data.clear()
         else:
             self.t.read(256)
         return "Reset signal sent (0xAA) - MCU is entering the bootloader window"

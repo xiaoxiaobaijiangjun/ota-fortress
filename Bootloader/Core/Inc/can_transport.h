@@ -41,6 +41,12 @@
 #define CBL_CAN_INJECT_CMD          0x1C  /* host -> MCU: inject one CAN frame   */
 #define CBL_CAN_FWD_CMD             0x1D  /* MCU -> host: forwarded CAN frame    */
 
+/* BL_CAN_Service quiet window in DWT cycles (~4 ms at the 16 MHz HSI boot
+ * clock): how long the CAN FIFO must stay empty after the last drained
+ * frame before servicing returns. Cycle-counted because HAL_GetTick loses
+ * seconds across flash-erase stalls. */
+#define BL_CAN_QUIET_CYCLES         64000U
+
 void    BL_CAN_Init(void);
 void    BL_CAN_Service(void);
 uint8_t BL_CAN_Activity(void);

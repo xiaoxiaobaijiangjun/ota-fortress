@@ -30,7 +30,7 @@ typedef struct
 	uint8_t  active;
 	uint8_t  last_sn;
 	uint8_t  cf_since_fc;
-	uint32_t last_frame_tick;
+	uint32_t last_frame_cyc;   /* DWT cycles; HAL_GetTick is stall-fragile */
 } BL_CanRx_t;
 
 static BL_CanRx_t rx;
@@ -46,7 +46,7 @@ static uint8_t can_send_raw(uint32_t std_id, const uint8_t *d)
 {
 	CAN_TxHeaderTypeDef hdr;
 	uint32_t mailbox = 0;
-	uint32_t t0 = HAL_GetTick();
+	uint32_t t0 = DWT->CYCCNT;
 
 	memset(&hdr, 0, sizeof(hdr));
 	hdr.StdId = std_id;
@@ -57,7 +57,7 @@ static uint8_t can_send_raw(uint32_t std_id, const uint8_t *d)
 
 	while(HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) == 0U)
 	{
-		if((HAL_GetTick() - t0) > 20U)
+		if((DWT->CYCCNT - t0) > 320000U)
 		{
 			return 0;
 		}
@@ -172,7 +172,7 @@ static void can_rx_feed(const uint8_t *d)
 			rx.active = 1U;
 			rx.last_sn = 0U;
 			rx.cf_since_fc = 0U;
-			rx.last_frame_tick = HAL_GetTick();
+			rx.last_frame_cyc = DWT->CYCCNT;
 			/* flow control: we are the receiver, allow BS frames then more */
 			{
 				uint8_t fc[8] = {0};
@@ -193,7 +193,7 @@ static void can_rx_feed(const uint8_t *d)
 			{
 				return;
 			}
-			rx.last_frame_tick = HAL_GetTick();
+			rx.last_frame_cyc = DWT->CYCCNT;
 			if(sn != ((rx.last_sn + 1U) & 0x0FU))
 			{
 				can_rx_reset();   /* lost frame: abort, host retries the packet */
@@ -239,7 +239,7 @@ static uint8_t can_tx_wait_fc(uint8_t *bs, uint8_t *stmin)
 {
 	CAN_RxHeaderTypeDef hdr;
 	uint8_t d[8];
-	uint32_t t0 = HAL_GetTick();
+	uint32_t t0 = DWT->CYCCNT;
 
 	while((HAL_GetTick() - t0) < BL_CAN_FC_TIMEOUT_MS)
 	{
@@ -347,36 +347,69 @@ void BL_CAN_Service(void)
 {
 	CAN_RxHeaderTypeDef hdr;
 	uint8_t d[8];
+	uint32_t quiet;
 
 	/* RX reassembly timeout: a stalled multi-frame must not wedge the FSM */
-	if(rx.active && ((HAL_GetTick() - rx.last_frame_tick) > BL_CAN_CF_TIMEOUT_MS))
+	if(rx.active && ((DWT->CYCCNT - rx.last_frame_cyc) > (BL_CAN_CF_TIMEOUT_MS * 16000U)))
 	{
 		can_rx_reset();
 	}
 
-	while(HAL_CAN_GetRxFifoFillLevel(&hcan1, CAN_RX_FIFO0) > 0U)
+	/* A loopback echo lands in FIFO0 only after its transmission completes
+	 * (~135 us at 500 kbps), and a dispatched packet transmits a reply whose
+	 * echo must be forwarded too. Keep draining until the FIFO has been
+	 * quiet for a few ms so one call completes the whole
+	 * request-echo -> dispatch -> reply-echo chain.
+	 * Timing uses the DWT cycle counter: HAL_GetTick() loses whole seconds
+	 * across long flash-erase stalls (SysTick cannot preempt a stalled
+	 * core, only one tick stays pending), which used to expire this quiet
+	 * window while the reply echo had not even landed. */
+	quiet = DWT->CYCCNT;
+	for(;;)
 	{
-		BL_IWDG_Refresh();
-		if(HAL_CAN_GetRxMessage(&hcan1, CAN_RX_FIFO0, &hdr, d) != HAL_OK)
+		if(HAL_CAN_GetRxFifoFillLevel(&hcan1, CAN_RX_FIFO0) > 0U)
+		{
+			BL_IWDG_Refresh();
+			if(HAL_CAN_GetRxMessage(&hcan1, CAN_RX_FIFO0, &hdr, d) != HAL_OK)
+			{
+				break;
+			}
+			quiet = DWT->CYCCNT;
+			if(hdr.IDE != CAN_ID_STD)
+			{
+				continue;
+			}
+			if(hdr.StdId == BL_CAN_RSP_ID)
+			{
+				/* our own TX looped back (C1) - forward to the host tunnel */
+#if BL_CAN_LOOPBACK_TEST
+				can_forward_to_uart(d);
+#endif
+				continue;
+			}
+			if(hdr.StdId == BL_CAN_REQ_ID)
+			{
+				can_rx_feed(d);
+				/* A dispatch can erase flash for seconds; restart the quiet
+				 * wait so the reply echo it just queued is forwarded. */
+				quiet = DWT->CYCCNT;
+			}
+			continue;
+		}
+		if((DWT->CYCCNT - quiet) > BL_CAN_QUIET_CYCLES)
 		{
 			break;
 		}
-		if(hdr.IDE != CAN_ID_STD)
+		/* The next host command can arrive within the quiet window (the
+		 * host sends the next inject the same millisecond it got a reply).
+		 * Bail out immediately so the UART parser takes over before the
+		 * 1-byte DR overruns - this UART has no FIFO. */
+		if(__HAL_UART_GET_FLAG(BL_HOST_COMMUNICATION_UART, UART_FLAG_RXNE) ||
+		   __HAL_UART_GET_FLAG(BL_HOST_COMMUNICATION_UART, UART_FLAG_ORE))
 		{
-			continue;
+			break;
 		}
-		if(hdr.StdId == BL_CAN_RSP_ID)
-		{
-			/* our own TX looped back (C1) - forward to the host tunnel */
-#if BL_CAN_LOOPBACK_TEST
-			can_forward_to_uart(d);
-#endif
-			continue;
-		}
-		if(hdr.StdId == BL_CAN_REQ_ID)
-		{
-			can_rx_feed(d);
-		}
+		BL_IWDG_Refresh();
 	}
 }
 
@@ -399,6 +432,11 @@ void BL_CAN_Init(void)
 {
 	GPIO_InitTypeDef gpio = {0};
 	CAN_FilterTypeDef filt = {0};
+
+	/* DWT cycle counter: the settle window in BL_CAN_Service is timed on
+	 * cycles - HAL_GetTick is unreliable across flash-erase stalls. */
+	CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+	DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 
 	/* PB8 = CAN1_RX, PB9 = CAN1_TX (AF9). Chosen to keep PA11/PA12 (USB)
 	 * free - see the project plan. */
