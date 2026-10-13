@@ -1,0 +1,29 @@
+# 开源原版是独立 git 仓库，不进外层版本控制（增量开发只跟踪二次开发部分）
+/fota-stm32/
+
+# Keil 编译产物
+*.o
+*.d
+*.crf
+*.lst
+*.dep
+*.axf
+*.htm
+*.lnp
+*.sct.bak
+Objects/
+Listings/
+Output/
+DebugConfig/
+*.uvgu.*
+JLinkLog.txt
+EventRecorderStub.scvd
+
+# 签名私钥（红线：不入仓库；公钥以 C 头文件形式编译进 Bootloader，可跟踪）
+*.pem
+keys/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
