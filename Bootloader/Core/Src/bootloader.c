@@ -5,10 +5,16 @@
 
 /************************************             Includes               ************************************/
 #include <string.h>
+#include <stdio.h>
+#include <stdarg.h>
 #include "bootloader.h"
 #include "fota_meta.h"
 #include "usart.h"
 #include "crc.h"
+#include "sha256.h"
+#include "image_tlv.h"
+#include "uECC.h"
+#include "bootloader_key.h"
 
 /************************************    Static Functions Decelerations  ************************************/
 static void Bootloader_Get_Chip_Identification_Number(uint8_t *Host_Buffer);
@@ -38,6 +44,12 @@ static uint8_t Bootloader_Resolve_Boot_Slot(void);
 static uint8_t Bootloader_Image_CRC_Verify(uint32_t base_addr, uint32_t image_len, uint32_t expected);
 static void BL_IWDG_Start(void);
 static void BL_IWDG_Refresh(void);
+#if BL_REQUIRE_SIGNED_IMAGES
+static uint8_t Bootloader_Verify_Signed_Image(uint32_t base, uint32_t image_len, uint32_t slot_end,
+                                               uint32_t *sv_out, uint32_t *verify_ms_out);
+#endif
+static void BL_Log(const char *fmt, ...);
+static const char *BL_Act_Reason(uint8_t status);
 
 /************************************    Global Variables Definitions     ************************************/
 static uint8_t BL_Host_Buffer[BL_HOST_BUFFER_RX_LENGTH];
@@ -651,16 +663,113 @@ static void Bootloader_Erase_Slot(uint8_t *Host_Buffer)
 	}
 }
 
+#if BL_REQUIRE_SIGNED_IMAGES
+/* Verify the signed-package trailer stored right after the image:
+ * TLV parse -> SHA-256(image || security_version_LE32) -> compare ->
+ * ECDSA-P256 verify against the compiled-in public key.
+ * Returns BL_ACT_STATUS_SUCCESS or the specific BL_ACT_FAIL_* code. */
+static uint8_t Bootloader_Verify_Signed_Image(uint32_t base, uint32_t image_len, uint32_t slot_end,
+                                               uint32_t *sv_out, uint32_t *verify_ms_out)
+{
+	Image_TLV_Info_t tlv;
+	SHA256_CTX sha;
+	uint8_t digest[SHA256_DIGEST_SIZE];
+	uint8_t sv_le[IMAGE_TLV_SV_LEN];
+	uint32_t cycles_start;
+
+	/* DWT cycle counter: measure the whole chain for the bring-up log. */
+	CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+	DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+	DWT->CYCCNT = 0U;
+	cycles_start = DWT->CYCCNT;
+
+	BL_IWDG_Refresh();
+	if(!Image_TLV_Parse(base + image_len, slot_end - (base + image_len), &tlv))
+	{
+		return BL_ACT_FAIL_NO_TLV;
+	}
+
+	/* digest = SHA-256(image || security_version_LE32), matching tools/sign.py.
+	 * The security version is covered by the digest AND the signature, so a
+	 * stripped or forged rollback counter cannot pass activation. */
+	BL_IWDG_Refresh();
+	sv_le[0] = (uint8_t)(tlv.security_version >> 0);
+	sv_le[1] = (uint8_t)(tlv.security_version >> 8);
+	sv_le[2] = (uint8_t)(tlv.security_version >> 16);
+	sv_le[3] = (uint8_t)(tlv.security_version >> 24);
+	sha256_init(&sha);
+	sha256_update(&sha, (const uint8_t *)base, image_len);
+	sha256_update(&sha, sv_le, sizeof(sv_le));
+	sha256_final(&sha, digest);
+
+	if(memcmp(digest, tlv.digest, SHA256_DIGEST_SIZE) != 0)
+	{
+		return BL_ACT_FAIL_DIGEST;
+	}
+
+	BL_IWDG_Refresh();
+	if(uECC_verify(BL_PUBLIC_KEY_XY, digest, SHA256_DIGEST_SIZE, tlv.signature, uECC_secp256r1()) != 1)
+	{
+		return BL_ACT_FAIL_SIGNATURE;
+	}
+
+	*sv_out = tlv.security_version;
+	*verify_ms_out = (DWT->CYCCNT - cycles_start) / (SystemCoreClock / 1000U);
+	return BL_ACT_STATUS_SUCCESS;
+}
+#endif /* BL_REQUIRE_SIGNED_IMAGES */
+
+/* Human-readable activate failure reason for the log line. */
+static const char *BL_Act_Reason(uint8_t status)
+{
+	switch(status)
+	{
+		case BL_ACT_FAIL_VALIDATION: return " (slot/image bounds/vector/CRC checks)";
+		case BL_ACT_FAIL_NO_TLV:     return " (no or malformed TLV signature trailer)";
+		case BL_ACT_FAIL_DIGEST:     return " (digest mismatch: image or sv altered)";
+		case BL_ACT_FAIL_SIGNATURE:  return " (ECDSA-P256 signature invalid)";
+		default:                     return "";
+	}
+}
+
+/* Printf-style log on the host UART. Only called AFTER the protocol reply of
+ * the current command has been sent, so the host's exact-length reads never
+ * see log bytes as stale reply data (the host drains them as text). */
+static void BL_Log(const char *fmt, ...)
+{
+	static char log_buf[112];
+	va_list args;
+	int n;
+
+	va_start(args, fmt);
+	n = vsnprintf(log_buf, sizeof(log_buf), fmt, args);
+	va_end(args);
+
+	if(n > 0)
+	{
+		if(n > (int)(sizeof(log_buf) - 1U))
+		{
+			n = (int)(sizeof(log_buf) - 1U);
+		}
+		(void)HAL_UART_Transmit(BL_HOST_COMMUNICATION_UART, (uint8_t *)log_buf, (uint32_t)n, HAL_MAX_DELAY);
+	}
+}
+
 static void Bootloader_Activate(uint8_t *Host_Buffer)
 {
 	/* Packet: [14][0x17][slot][image_len LE32][image_crc LE32][CRC32]
-	 * Whole-image CRC is verified against the flash content before the
-	 * slot is marked TRIAL and booted. */
-	uint16_t Host_CMD_Packet_Len = Host_Buffer[0] + 1;
-	uint32_t Host_CRC32 = *((uint32_t *)((Host_Buffer + Host_CMD_Packet_Len) - CRC_TYPE_SIZE_BYTE));
-	uint8_t Status = 0x00;
+	 * Validation chain: slot range -> image bounds -> vector sanity ->
+	 * whole-image CRC -> signature trailer (BL_REQUIRE_SIGNED_IMAGES).
+	 * The 1-byte status reply is sent BEFORE any log line. */
+	uint16_t Host_CMD_Packet_Len = 0;
+	uint32_t Host_CRC32 = 0;
+	uint8_t Status = BL_ACT_FAIL_VALIDATION;
 
-	if(CRC_VERIFICATION_PASSED == Bootloader_CRC_Verify((uint8_t *)&Host_Buffer[0], Host_CMD_Packet_Len - 4, Host_CRC32))
+	/* Extract the CRC32 and packet length sent by the HOST */
+	Host_CMD_Packet_Len = Host_Buffer[0] + 1;
+	Host_CRC32 = *((uint32_t *)((Host_Buffer + Host_CMD_Packet_Len) - CRC_TYPE_SIZE_BYTE));
+	/* CRC Verification */
+	if(CRC_VERIFICATION_PASSED == Bootloader_CRC_Verify((uint8_t *)&Host_Buffer[0] , Host_CMD_Packet_Len - 4, Host_CRC32))
 	{
 		BL_IWDG_Refresh();
 		uint8_t slot = Host_Buffer[2];
@@ -668,11 +777,29 @@ static void Bootloader_Activate(uint8_t *Host_Buffer)
 		uint32_t image_crc = *((uint32_t *)(&Host_Buffer[7]));
 		uint32_t base = 0;
 		uint32_t end = 0;
+#if BL_REQUIRE_SIGNED_IMAGES
+		uint32_t sv = 0U;
+		uint32_t verify_ms = 0U;
+#endif
 
 		if(Bootloader_Slot_Range(slot, &base, &end) &&
 		   (image_len >= 8U) && (image_len <= (end - base)) &&
 		   Bootloader_Is_App_Valid(base, end) &&
 		   (CRC_VERIFICATION_PASSED == Bootloader_Image_CRC_Verify(base, image_len, image_crc)))
+		{
+#if BL_REQUIRE_SIGNED_IMAGES
+			Status = Bootloader_Verify_Signed_Image(base, image_len, end, &sv, &verify_ms);
+#else
+			/* Debug build: unsigned packages activate. Never ship this. */
+			Status = BL_ACT_STATUS_SUCCESS;
+#endif
+		}
+		else
+		{
+			Status = BL_ACT_FAIL_VALIDATION;
+		}
+
+		if(BL_ACT_STATUS_SUCCESS == Status)
 		{
 			FOTA_Meta_t meta;
 			memset(&meta, 0, sizeof(meta));
@@ -685,13 +812,19 @@ static void Bootloader_Activate(uint8_t *Host_Buffer)
 
 			if(Meta_Write(&meta))
 			{
-				Status = 0x01;
 				Bootloader_Send_Data_To_Host(&Status, 1);
+#if BL_REQUIRE_SIGNED_IMAGES
+				BL_Log("[BL] activate slot=%c: signature OK (sv=%lu, verify %lu ms), jumping\r\n",
+				       (slot == META_SLOT_B) ? 'B' : 'A', (unsigned long)sv, (unsigned long)verify_ms);
+#endif
 				Bootloader_Jump_To_App_At(base);
 				return;
 			}
+			Status = BL_ACT_FAIL_VALIDATION;
 		}
+
 		Bootloader_Send_Data_To_Host(&Status, 1);
+		BL_Log("[BL] activate rejected: 0x%02X%s\r\n", Status, BL_Act_Reason(Status));
 	}
 	else
 	{

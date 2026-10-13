@@ -12,16 +12,19 @@
 *.lnp
 *.sct.bak
 Objects/
+Objects_B/
 Listings/
 Output/
 DebugConfig/
 *.uvgu.*
+build_log.txt
 JLinkLog.txt
 EventRecorderStub.scvd
 
 # 签名私钥（红线：不入仓库；公钥以 C 头文件形式编译进 Bootloader，可跟踪）
 *.pem
 keys/
+!tools/fota_public.pem
 
 # Python
 __pycache__/

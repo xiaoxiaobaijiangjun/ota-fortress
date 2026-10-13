@@ -10,12 +10,16 @@ an ESP32, Firebase or Node-RED:
 
     python fota_host.py --port COM5 status
     python fota_host.py --port COM5 --slot B erase
-    python fota_host.py --port COM5 --slot B upload FOTA_App_B.bin
-    python fota_host.py --port COM5 --slot B activate FOTA_App_B.bin
+    python fota_host.py --port COM5 --slot B upload FOTA_App_B_signed.bin
+    python fota_host.py --port COM5 --slot B activate FOTA_App_B_signed.bin
     python fota_host.py --port COM5 monitor --seconds 10   # watch the app heartbeat
 
     # one-shot demo: reboot into bootloader, erase B, upload, activate
-    python fota_host.py --port COM5 --slot B update FOTA_App_B.bin
+    python fota_host.py --port COM5 --slot B update FOTA_App_B_signed.bin
+
+    # sign a build first (the bootloader rejects unsigned packages):
+    python tools/keygen.py                 # once: keypair + Bootloader key header
+    python tools/sign.py <image>.bin --sv 1 -o <image>_signed.bin
 
     # protocol self-test against a simulated bootloader (no hardware needed)
     python fota_host.py selftest
@@ -34,10 +38,12 @@ original ESP32 sketch (EhabMagdyy/FOTA-STM32).
 """
 
 import argparse
+import hashlib
 import io
 import sys
 import struct
 import time
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Memory map & metadata
@@ -71,6 +77,59 @@ CMD_WRITE = 0x14
 CMD_GET_STATUS = 0x15
 CMD_ERASE_SLOT = 0x16
 CMD_ACTIVATE = 0x17
+
+# ACTIVATE reply status codes (see Bootloader/Core/Inc/bootloader.h)
+ACT_STATUS = {
+    0x00: "validation failed (slot/image bounds/vector/CRC)",
+    0x01: "success",
+    0x10: "no or malformed TLV signature trailer",
+    0x11: "digest mismatch (image or security_version altered)",
+    0x12: "ECDSA-P256 signature invalid",
+}
+
+# ---------------------------------------------------------------------------
+# Signed packages (image + TLV trailer). The trailer format lives in
+# tools/fota_tlv.py so the signer, this tool and the MCU bootloader can never
+# drift apart (the MCU side is Bootloader/Core/Inc/image_tlv.h).
+# ---------------------------------------------------------------------------
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+import fota_tlv  # noqa: E402  (tools/fota_tlv.py)
+
+PUBLIC_KEY_PATH = Path(__file__).resolve().parent.parent / "tools" / "fota_public.pem"
+
+
+class FirmwareFile:
+    """A firmware file: bare image or signed package (image + TLV trailer).
+
+    blob   - whole file content, trailer included (what gets uploaded)
+    image  - the bare image (what ACTIVATE's image_len/CRC refer to)
+    sv     - security version from the trailer (None when unsigned)
+    signed - True when a structurally valid trailer terminated the file
+    """
+
+    def __init__(self, data: bytes):
+        self.blob = data
+        parsed = fota_tlv.parse_package(data)
+        self.signed = parsed is not None
+        if parsed:
+            self.image, self.sv, _, _ = parsed
+        else:
+            self.image, self.sv = data, None
+        self.note = ""
+
+
+def preverify(fw: FirmwareFile) -> None:
+    """Host-side package check before touching the MCU (fail fast)."""
+    if not fw.signed:
+        fw.note = "unsigned image (no TLV trailer) - the bootloader will reject it"
+        return
+    if not PUBLIC_KEY_PATH.exists():
+        fw.note = f"signed package (sv={fw.sv}) - {PUBLIC_KEY_PATH.name} missing, pre-check skipped"
+        return
+    ok, reason, _, _ = fota_tlv.verify_package(fw.blob, PUBLIC_KEY_PATH.read_bytes())
+    fw.note = f"signed package (sv={fw.sv}) - host pre-check: {reason}"
+    if not ok:
+        raise RuntimeError(f"host-side package verification failed: {reason}")
 
 
 def slot_range(slot):
@@ -199,12 +258,17 @@ class SimulatedSTM32:
 
     CHIP_ID = 0x413  # STM32F407
 
-    def __init__(self):
+    def __init__(self, public_pem: bytes = None):
         self.flash = bytearray(0x100000)          # 1 MB model
         self.flash[:] = b"\xFF" * len(self.flash)
         self.jumped = False
         self.rx = bytearray()
         self.tx = bytearray()
+        # Public key used to mirror the MCU's signature check; None disables
+        # the ECDSA step (structure + digest are still enforced).
+        if public_pem is None and PUBLIC_KEY_PATH.exists():
+            public_pem = PUBLIC_KEY_PATH.read_bytes()
+        self.public_pem = public_pem
 
     # -- wire interface -----------------------------------------------------
     def write(self, data: bytes) -> None:
@@ -385,12 +449,42 @@ class SimulatedSTM32:
                     idx = base - 0x08000000
                     calc = crc32_fota(bytes(self.flash[idx : idx + image_len]))
                     if calc == image_crc:
-                        self._meta_write(slot, META_STATE_TRIAL, image_len, image_crc)
-                        status = 0x01
-                        self.jumped = True
+                        status = self._verify_signed(idx, image_len)
+                        if status == 0x01:
+                            self._meta_write(slot, META_STATE_TRIAL, image_len, image_crc)
+                            self.jumped = True
             self.tx.append(status)
         else:
             self.tx.append(NACK)
+
+    def _verify_signed(self, idx: int, image_len: int) -> int:
+        """Mirror Bootloader_Verify_Signed_Image on the MCU: parse the TLV
+        trailer stored right after the image, recompute the digest over
+        image || security_version and check the ECDSA-P256 signature.
+        Returns the ACT_STATUS code (0x01 = success)."""
+        if idx + image_len + 6 > len(self.flash):
+            return 0x10
+        head = bytes(self.flash[idx + image_len : idx + image_len + 6])
+        if head[:4] != fota_tlv.TLV_MAGIC:
+            return 0x10
+        (tlv_len,) = struct.unpack_from("<H", head, 4)
+        probe = bytes(self.flash[idx + image_len : idx + image_len + 6 + tlv_len])
+        parsed = fota_tlv._parse_at(probe, 0)
+        if not parsed:
+            return 0x10
+        _, sv, digest, sig = parsed
+        image = bytes(self.flash[idx : idx + image_len])
+        if hashlib.sha256(image + struct.pack("<I", sv)).digest() != digest:
+            return 0x11
+        if self.public_pem:
+            try:
+                import ecdsa
+
+                vk = ecdsa.VerifyingKey.from_pem(self.public_pem.decode())
+                vk.verify_digest(sig, digest, sigdecode=ecdsa.util.sigdecode_string)
+            except Exception:
+                return 0x12
+        return 0x01
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +499,25 @@ class FOTAClient:
         reply = self.t.read(reply_len)
         if len(reply) != reply_len:
             raise RuntimeError(f"timeout waiting for reply (got {len(reply)}/{reply_len} bytes)")
+        return reply
+
+    def _send_with_logs(self, packet: bytes, reply_len: int) -> bytes:
+        """_send, then drain any log text the MCU emits AFTER the reply byte
+        (activate sends its status first, then a human-readable line)."""
+        reply = self._send(packet, reply_len)
+        ser = getattr(self.t, "ser", None)
+        if ser is not None:
+            old_timeout = ser.timeout
+            ser.timeout = 0.3
+            try:
+                while True:
+                    chunk = ser.read(256)
+                    if not chunk:
+                        break
+                    sys.stdout.write(chunk.decode("ascii", errors="replace"))
+                    sys.stdout.flush()
+            finally:
+                ser.timeout = old_timeout
         return reply
 
     def get_chip_id(self) -> str:
@@ -485,17 +598,18 @@ class FOTAClient:
             return False, f"reset vector 0x{reset:08X} not inside slot {name} (0x{base:X}-0x{base + size:X})"
         return True, ""
 
-    def activate(self, firmware: bytes, slot: int = SLOT_A) -> str:
-        ok, why = self._image_ok_for_slot(firmware, slot)
+    def activate(self, firmware, slot: int = SLOT_A) -> str:
+        fw = firmware if isinstance(firmware, FirmwareFile) else FirmwareFile(firmware)
+        ok, why = self._image_ok_for_slot(fw.image, slot)
         if not ok:
             return f"Activate Refused: {why}"
-        packet = activate_cmd(slot, len(firmware), crc32_fota(firmware))
-        reply = self._send(packet, 1)
+        packet = activate_cmd(slot, len(fw.image), crc32_fota(fw.image))
+        reply = self._send_with_logs(packet, 1)
         if reply[0] == NACK:
             return "NACK"
         if reply[0] == 0x01:
-            return "Activate Success (image verified, jumping...)"
-        return "Activate Failed (image CRC/validation error)"
+            return "Activate Success (CRC + signature verified, jumping...)"
+        return f"Activate Failed: {ACT_STATUS.get(reply[0], f'status 0x{reply[0]:02X}')}"
 
     def jump(self) -> str:
         reply = self._send(simple_cmd(CMD_JUMP), 1)
@@ -526,13 +640,14 @@ class FOTAClient:
             self.t.read(256)
         return "Reset signal sent (0xAA) - MCU is entering the bootloader window"
 
-    def update(self, firmware: bytes, slot: int = SLOT_B) -> str:
+    def update(self, firmware, slot: int = SLOT_B) -> str:
         """One-shot demo flow: reboot -> erase slot -> upload -> activate."""
+        fw = firmware if isinstance(firmware, FirmwareFile) else FirmwareFile(firmware)
         print(self.reboot())
         time.sleep(0.15)
         print(self.erase_slot(slot))
-        print(self.upload(firmware, slot))
-        return self.activate(firmware, slot)
+        print(self.upload(fw.blob, slot))
+        return self.activate(fw, slot)
 
 
 # ---------------------------------------------------------------------------
@@ -617,7 +732,21 @@ def run_selftest() -> int:
     assert meta == dict(active=SLOT_A, state=META_STATE_TRIAL, image_len=700, image_crc=0x12345678)
     print("[PASS] metadata pack/unpack round trip (20 bytes)")
 
-    sim = SimulatedSTM32()
+    # The simulator mirrors the production bootloader (BL_REQUIRE_SIGNED_IMAGES):
+    # unsigned images and bad signatures are rejected, so every success path
+    # signs its package with an ephemeral key pinned into the simulator.
+    try:
+        import ecdsa
+    except ImportError:
+        print("selftest requires the 'ecdsa' package: pip install ecdsa")
+        return 1
+    sk = ecdsa.SigningKey.generate(curve=ecdsa.NIST256p)
+    sk_wrong = ecdsa.SigningKey.generate(curve=ecdsa.NIST256p)
+
+    def signed(image: bytes, sv: int = 1, key=None) -> FirmwareFile:
+        return FirmwareFile(fota_tlv.build_package(image, sv, key or sk))
+
+    sim = SimulatedSTM32(public_pem=sk.get_verifying_key().to_pem())
     client = FOTAClient(sim)
 
     # 3) simple commands
@@ -631,24 +760,65 @@ def run_selftest() -> int:
     assert client.jump() == "Jump Failed (no valid app)"
     print("[PASS] Jump with empty flash -> rejected")
 
-    # 4) first-time setup on slot A
+    # 4) first-time setup on slot A: upload a SIGNED package
     fw_a = fake_firmware(700, 7, 0x20010000, SLOT_A_BASE + 0x100)
+    pkg_a = signed(fw_a)
     assert client.erase_slot(SLOT_A) == "Erase Success"
     print("[PASS] Erase slot A (empty metadata) -> Success")
-    assert client.upload(fw_a, SLOT_A) == "Upload Success (700 bytes in 11 chunks)"
-    print("[PASS] Upload 700-byte synthetic firmware to slot A")
+    assert client.upload(pkg_a.blob, SLOT_A) == "Upload Success (818 bytes in 13 chunks)"
+    print("[PASS] Upload 700-byte signed package to slot A (image + 118-byte trailer)")
     off_a = SLOT_A_BASE - 0x08000000
     assert bytes(sim.flash[off_a : off_a + 700]) == fw_a
-    print("[PASS] Flash content matches uploaded firmware")
+    print("[PASS] Flash content matches the uploaded image part")
 
-    # 5) activate with a corrupt image CRC -> refused, nothing jumped
-    assert client.activate(fw_a[:-1] + b"\x00", SLOT_A) == "Activate Failed (image CRC/validation error)"
+    # 5) activate with an image differing from flash -> CRC rejects first
+    assert client.activate(FirmwareFile(fw_a[:-1] + b"\x00"), SLOT_A) == (
+        "Activate Failed: validation failed (slot/image bounds/vector/CRC)"
+    )
     assert sim.jumped is False
     assert sim._meta_read() is None
-    print("[PASS] Activate with bad image CRC -> rejected, metadata untouched")
+    print("[PASS] Activate with altered image -> CRC rejected, metadata untouched")
 
-    # 6) activate ok -> TRIAL, jumped
-    assert client.activate(fw_a, SLOT_A) == "Activate Success (image verified, jumping...)"
+    # 5b) signature enforcement matrix (mirrors the MCU Bootloader_Verify chain)
+    # 5b.1 unsigned legacy image: no trailer in flash -> 0x10
+    assert client.erase_slot(SLOT_A) == "Erase Success"
+    assert client.upload(fw_a, SLOT_A) == "Upload Success (700 bytes in 11 chunks)"
+    r = client.activate(FirmwareFile(fw_a), SLOT_A)
+    assert r == "Activate Failed: no or malformed TLV signature trailer", r
+    print("[PASS] Unsigned legacy image -> rejected 0x10 (no TLV trailer)")
+
+    # 5b.2 tampered image with a consistent CRC: the attacker can always fix
+    # the CRC (it is linear) - the digest is what stops them -> 0x11
+    _, sv_a, digest_a, sig_a = fota_tlv.parse_package(pkg_a.blob)
+    flipped = bytearray(fw_a)
+    flipped[600] ^= 0xFF
+    tampered = FirmwareFile(bytes(flipped) + fota_tlv.build_trailer(sv_a, digest_a, sig_a))
+    assert client.erase_slot(SLOT_A) == "Erase Success"
+    assert client.upload(tampered.blob, SLOT_A) == "Upload Success (818 bytes in 13 chunks)"
+    r = client.activate(tampered, SLOT_A)
+    assert r == "Activate Failed: digest mismatch (image or security_version altered)", r
+    print("[PASS] Tampered image with recomputed CRC -> rejected 0x11 (digest mismatch)")
+
+    # 5b.3 attacker re-signs with their own key -> 0x12
+    pkg_wrongkey = signed(fw_a, key=sk_wrong)
+    assert client.erase_slot(SLOT_A) == "Erase Success"
+    assert client.upload(pkg_wrongkey.blob, SLOT_A) == "Upload Success (818 bytes in 13 chunks)"
+    r = client.activate(pkg_wrongkey, SLOT_A)
+    assert r == "Activate Failed: ECDSA-P256 signature invalid", r
+    print("[PASS] Wrong-key signature -> rejected 0x12")
+
+    # 5b.4 one flipped signature byte -> 0x12
+    pkg_badsig = FirmwareFile(pkg_a.blob[:-1] + bytes([pkg_a.blob[-1] ^ 0x01]))
+    assert client.erase_slot(SLOT_A) == "Erase Success"
+    assert client.upload(pkg_badsig.blob, SLOT_A) == "Upload Success (818 bytes in 13 chunks)"
+    r = client.activate(pkg_badsig, SLOT_A)
+    assert r == "Activate Failed: ECDSA-P256 signature invalid", r
+    print("[PASS] Tampered signature byte -> rejected 0x12")
+
+    # 6) activate the genuine package ok -> TRIAL, jumped
+    assert client.erase_slot(SLOT_A) == "Erase Success"
+    assert client.upload(pkg_a.blob, SLOT_A) == "Upload Success (818 bytes in 13 chunks)"
+    assert client.activate(pkg_a, SLOT_A) == "Activate Success (CRC + signature verified, jumping...)"
     assert sim.jumped is True
     assert client.get_slot_status() == (SLOT_A, META_STATE_TRIAL, 700)
     print("[PASS] Activate slot A -> Success, state TRIAL")
@@ -659,7 +829,7 @@ def run_selftest() -> int:
     print("[PASS] Unconfirmed TRIAL rolled back on power cycle (old slot boots)")
 
     # 8) activate A again, confirm, power cycle -> stays on A
-    assert client.activate(fw_a, SLOT_A) == "Activate Success (image verified, jumping...)"
+    assert client.activate(pkg_a, SLOT_A) == "Activate Success (CRC + signature verified, jumping...)"
     sim.confirm_app()
     assert client.get_slot_status() == (SLOT_A, META_STATE_IDLE, 700)
     assert sim.power_cycle() is True
@@ -674,46 +844,48 @@ def run_selftest() -> int:
     # 9b) a corrupt active slot must remain erasable (recovery path)
     sim.flash[off_a : off_a + 8] = b"\x00" * 8  # destroy the vector table
     assert client.erase_slot(SLOT_A) == "Erase Success"
-    assert client.upload(fw_a, SLOT_A) == "Upload Success (700 bytes in 11 chunks)"
-    assert client.activate(fw_a, SLOT_A) == "Activate Success (image verified, jumping...)"
+    assert client.upload(pkg_a.blob, SLOT_A) == "Upload Success (818 bytes in 13 chunks)"
+    assert client.activate(pkg_a, SLOT_A) == "Activate Success (CRC + signature verified, jumping...)"
     sim.confirm_app()
     print("[PASS] Corrupt active slot can be erased for recovery")
 
     # 10) update to B without confirmation -> power cycle rolls back to A
     fw_b = fake_firmware(500, 13, 0x20020000 - 0x1000, SLOT_B_BASE + 0x100)
+    pkg_b = signed(fw_b)
     assert client.erase_slot(SLOT_B) == "Erase Success"
-    assert client.upload(fw_b, SLOT_B) == "Upload Success (500 bytes in 8 chunks)"
+    assert client.upload(pkg_b.blob, SLOT_B) == "Upload Success (618 bytes in 10 chunks)"
     off_b = SLOT_B_BASE - 0x08000000
     assert bytes(sim.flash[off_b : off_b + 500]) == fw_b
-    assert client.activate(fw_b, SLOT_B) == "Activate Success (image verified, jumping...)"
+    assert client.activate(pkg_b, SLOT_B) == "Activate Success (CRC + signature verified, jumping...)"
     assert sim.power_cycle() is True            # A boots again
     assert client.get_slot_status() == (SLOT_A, META_STATE_IDLE, 0)
     print("[PASS] Bad update to B rolls back to A on power cycle")
 
     # 11) update to B + confirm -> power cycle stays on B
     assert client.erase_slot(SLOT_B) == "Erase Success"
-    assert client.upload(fw_b, SLOT_B) == "Upload Success (500 bytes in 8 chunks)"
-    assert client.activate(fw_b, SLOT_B) == "Activate Success (image verified, jumping...)"
+    assert client.upload(pkg_b.blob, SLOT_B) == "Upload Success (618 bytes in 10 chunks)"
+    assert client.activate(pkg_b, SLOT_B) == "Activate Success (CRC + signature verified, jumping...)"
     sim.confirm_app()
     assert client.get_slot_status() == (SLOT_B, META_STATE_IDLE, 500)
     assert sim.power_cycle() is True
     assert client.get_slot_status() == (SLOT_B, META_STATE_IDLE, 500)
     print("[PASS] Confirmed update to B survives power cycle")
 
-    # 12) optional: upload the real compiled demo application
+    # 12) optional: upload the real compiled demo application (signed)
     app_bin = args_real_app()
     if app_bin:
+        pkg_real = signed(app_bin)
         assert client.erase_slot(SLOT_A) == "Erase Success"
-        assert "Upload Success" in client.upload(app_bin, SLOT_A)
+        assert "Upload Success" in client.upload(pkg_real.blob, SLOT_A)
         stored = bytes(sim.flash[off_a : off_a + len(app_bin)])
         assert stored == app_bin
         # wrong slot gate: the slot-A build must not activate into slot B
-        assert "not inside slot B" in client.activate(app_bin, SLOT_B)
-        assert client.activate(app_bin, SLOT_A) == "Activate Success (image verified, jumping...)"
+        assert "not inside slot B" in client.activate(pkg_real, SLOT_B)
+        assert client.activate(pkg_real, SLOT_A) == "Activate Success (CRC + signature verified, jumping...)"
         sim.confirm_app()
         assert sim.power_cycle() is True
         assert client.get_slot_status() == (SLOT_A, META_STATE_IDLE, len(app_bin))
-        print(f"[PASS] Real FOTA_App.bin ({len(app_bin)} bytes) dual-slot upload + activate + confirm")
+        print(f"[PASS] Real FOTA_App.bin ({len(app_bin)} bytes) signed upload + activate + confirm")
 
         # 13) boot-time whole-image CRC: corrupting a confirmed slot makes it
         # untrusted at power-up, so the other slot boots instead
@@ -724,7 +896,7 @@ def run_selftest() -> int:
 
         # 14) one-shot update() flow: reboot magic + erase + upload + activate
         # (A is inactive here, so the erase is allowed)
-        assert "Activate Success" in client.update(app_bin, SLOT_A)
+        assert "Activate Success" in client.update(pkg_real, SLOT_A)
         assert sim.jumped is True
         sim.confirm_app()
         assert client.get_slot_status() == (SLOT_A, META_STATE_IDLE, len(app_bin))
@@ -809,20 +981,24 @@ def main() -> int:
             if not args.file:
                 print("usage: fota_host.py upload <file.bin> [--slot A|B]")
                 return 2
-            firmware = open(args.file, "rb").read()
-            print(client.upload(firmware, slot))
+            fw = FirmwareFile(open(args.file, "rb").read())
+            print(client.upload(fw.blob, slot))
         elif args.command == "activate":
             if not args.file:
                 print("usage: fota_host.py activate <file.bin> [--slot A|B]")
                 return 2
-            firmware = open(args.file, "rb").read()
-            print(client.activate(firmware, slot))
+            fw = FirmwareFile(open(args.file, "rb").read())
+            preverify(fw)
+            print(fw.note)
+            print(client.activate(fw, slot))
         elif args.command == "update":
             if not args.file:
                 print("usage: fota_host.py update <file.bin> [--slot A|B]")
                 return 2
-            firmware = open(args.file, "rb").read()
-            print(client.update(firmware, slot))
+            fw = FirmwareFile(open(args.file, "rb").read())
+            preverify(fw)
+            print(fw.note)
+            print(client.update(fw, slot))
         elif args.command == "reboot":
             print(client.reboot())
         elif args.command == "jump":

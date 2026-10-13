@@ -37,7 +37,7 @@
           <bCustSvd>0</bCustSvd>
           <UseEnv>0</UseEnv>
           <BinPath></BinPath>
-          <IncludePath>..\Core\Inc;..\Drivers\STM32F4xx_HAL_Driver\Inc;..\Drivers\STM32F4xx_HAL_Driver\Inc\Legacy;..\Drivers\CMSIS\Device\ST\STM32F4xx\Include;..\Drivers\CMSIS\Include</IncludePath>
+          <IncludePath>..\Core\Inc;..\ThirdParty\micro-ecc;..\Drivers\STM32F4xx_HAL_Driver\Inc;..\Drivers\STM32F4xx_HAL_Driver\Inc\Legacy;..\Drivers\CMSIS\Device\ST\STM32F4xx\Include;..\Drivers\CMSIS\Include</IncludePath>
           <LibPath></LibPath>
           <RegisterFilePath></RegisterFilePath>
           <DBRegisterFilePath></DBRegisterFilePath>
@@ -337,9 +337,9 @@
             <v6Rtti>0</v6Rtti>
             <VariousControls>
               <MiscControls></MiscControls>
-              <Define>STM32F407xx,USE_HAL_DRIVER</Define>
+              <Define>STM32F407xx,USE_HAL_DRIVER,uECC_PLATFORM=uECC_arch_other,uECC_SUPPORTS_secp160r1=0,uECC_SUPPORTS_secp192r1=0,uECC_SUPPORTS_secp224r1=0,uECC_SUPPORTS_secp256k1=0,uECC_SUPPORT_COMPRESSED_POINT=0</Define>
               <Undefine></Undefine>
-              <IncludePath>..\Core\Inc;..\Drivers\STM32F4xx_HAL_Driver\Inc;..\Drivers\STM32F4xx_HAL_Driver\Inc\Legacy;..\Drivers\CMSIS\Device\ST\STM32F4xx\Include;..\Drivers\CMSIS\Include</IncludePath>
+              <IncludePath>..\Core\Inc;..\ThirdParty\micro-ecc;..\Drivers\STM32F4xx_HAL_Driver\Inc;..\Drivers\STM32F4xx_HAL_Driver\Inc\Legacy;..\Drivers\CMSIS\Device\ST\STM32F4xx\Include;..\Drivers\CMSIS\Include</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -357,7 +357,7 @@
               <MiscControls></MiscControls>
               <Define></Define>
               <Undefine></Undefine>
-              <IncludePath>..\Core\Inc;..\Drivers\STM32F4xx_HAL_Driver\Inc;..\Drivers\STM32F4xx_HAL_Driver\Inc\Legacy;..\Drivers\CMSIS\Device\ST\STM32F4xx\Include;..\Drivers\CMSIS\Include</IncludePath>
+              <IncludePath>..\Core\Inc;..\ThirdParty\micro-ecc;..\Drivers\STM32F4xx_HAL_Driver\Inc;..\Drivers\STM32F4xx_HAL_Driver\Inc\Legacy;..\Drivers\CMSIS\Device\ST\STM32F4xx\Include;..\Drivers\CMSIS\Include</IncludePath>
             </VariousControls>
           </Aads>
           <LDads>
@@ -414,6 +414,16 @@
               <FilePath>..\Core\Src\crc.c</FilePath>
             </File>
             <File>
+              <FileName>sha256.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\sha256.c</FilePath>
+            </File>
+            <File>
+              <FileName>image_tlv.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\image_tlv.c</FilePath>
+            </File>
+            <File>
               <FileName>gpio.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Core\Src\gpio.c</FilePath>
@@ -432,6 +442,16 @@
               <FileName>stm32f4xx_hal_msp.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Core\Src\stm32f4xx_hal_msp.c</FilePath>
+            </File>
+          </Files>
+        </Group>
+        <Group>
+          <GroupName>ThirdParty</GroupName>
+          <Files>
+            <File>
+              <FileName>uECC.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\ThirdParty\micro-ecc\uECC.c</FilePath>
             </File>
           </Files>
         </Group>

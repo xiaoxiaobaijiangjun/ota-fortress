@@ -44,6 +44,19 @@
 #define CBL_ERASE_SLOT_CMD               0x16  /* Erase slot A (0) or B (1)                    */
 #define CBL_ACTIVATE_CMD                 0x17  /* Verify whole image CRC, set TRIAL, jump      */
 
+/*************************************  Signed Images  ******************************************/
+/* 1 = production: ACTIVATE rejects any package without a valid TLV signature trailer.
+ * 0 = debug build: unsigned packages activate too (bring-up only, never ship). */
+#define BL_REQUIRE_SIGNED_IMAGES        1U
+
+/* ACTIVATE reply codes (1 byte). The status byte is sent FIRST, any human
+ * readable log line goes out AFTER it (the host drains it as text). */
+#define BL_ACT_STATUS_SUCCESS           0x01U
+#define BL_ACT_FAIL_VALIDATION          0x00U  /* slot range / image bounds / vector / CRC */
+#define BL_ACT_FAIL_NO_TLV              0x10U  /* signature trailer missing or malformed   */
+#define BL_ACT_FAIL_DIGEST              0x11U  /* recomputed digest != trailer digest      */
+#define BL_ACT_FAIL_SIGNATURE           0x12U  /* ECDSA-P256 verification failed           */
+
 /*************************************  CRC Verification  *************************************/
 #define CRC_TYPE_SIZE_BYTE               4
 #define CRC_VERIFICATION_FAILED          0x00
