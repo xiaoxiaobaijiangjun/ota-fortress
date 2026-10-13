@@ -300,8 +300,8 @@ static uint8_t Meta_Read(FOTA_Meta_t *meta)
 	{
 		return 0;
 	}
-	/* Whole-record integrity: CRC over the 16 bytes before meta_crc */
-	return (Bootloader_CRC_Calculate(p, 16U) == meta->meta_crc);
+	/* Whole-record integrity: CRC over the META_CRC_COVERED_LEN bytes before meta_crc */
+	return (Bootloader_CRC_Calculate(p, META_CRC_COVERED_LEN) == meta->meta_crc);
 }
 
 static uint8_t Meta_Write(const FOTA_Meta_t *meta)
@@ -313,7 +313,7 @@ static uint8_t Meta_Write(const FOTA_Meta_t *meta)
 	uint8_t ok = 0;
 
 	/* Recompute the record CRC before storing */
-	tmp.meta_crc = Bootloader_CRC_Calculate((const uint8_t *)&tmp, 16U);
+	tmp.meta_crc = Bootloader_CRC_Calculate((const uint8_t *)&tmp, META_CRC_COVERED_LEN);
 
 	/* Metadata lives in its own sector (2): erasing it never touches a slot */
 	HAL_FLASH_Unlock();
@@ -728,6 +728,7 @@ static const char *BL_Act_Reason(uint8_t status)
 		case BL_ACT_FAIL_NO_TLV:     return " (no or malformed TLV signature trailer)";
 		case BL_ACT_FAIL_DIGEST:     return " (digest mismatch: image or sv altered)";
 		case BL_ACT_FAIL_SIGNATURE:  return " (ECDSA-P256 signature invalid)";
+		case BL_ACT_FAIL_SEC_VERSION: return " (security version below anti-rollback floor)";
 		default:                     return "";
 	}
 }
@@ -789,6 +790,19 @@ static void Bootloader_Activate(uint8_t *Host_Buffer)
 		{
 #if BL_REQUIRE_SIGNED_IMAGES
 			Status = Bootloader_Verify_Signed_Image(base, image_len, end, &sv, &verify_ms);
+			if(BL_ACT_STATUS_SUCCESS == Status)
+			{
+				/* Anti-rollback floor (feature B): min_sv only ever rises. A
+				 * validly-signed but OLDER image (sv below the floor) is a
+				 * downgrade attack, rejected here. Rolling back an
+				 * unconfirmed TRIAL slot never reaches this check. */
+				FOTA_Meta_t cur_meta;
+
+				if(Meta_Read(&cur_meta) && (sv < cur_meta.min_sv))
+				{
+					Status = BL_ACT_FAIL_SEC_VERSION;
+				}
+			}
 #else
 			/* Debug build: unsigned packages activate. Never ship this. */
 			Status = BL_ACT_STATUS_SUCCESS;
@@ -809,6 +823,11 @@ static void Bootloader_Activate(uint8_t *Host_Buffer)
 			meta.state = META_STATE_TRIAL;
 			meta.image_len = image_len;
 			meta.image_crc = image_crc;
+#if BL_REQUIRE_SIGNED_IMAGES
+			meta.min_sv = sv;   /* raise the floor; never lowered elsewhere */
+#else
+			meta.min_sv = 0U;   /* debug build: no anti-rollback guarantee */
+#endif
 
 			if(Meta_Write(&meta))
 			{

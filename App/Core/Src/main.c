@@ -193,7 +193,7 @@ static uint8_t APP_Meta_Read(FOTA_Meta_t *meta)
   {
     return 0;
   }
-  return (APP_CRC32_FOTA(p, 16U) == meta->meta_crc);
+  return (APP_CRC32_FOTA(p, META_CRC_COVERED_LEN) == meta->meta_crc);
 }
 
 /**
@@ -218,8 +218,10 @@ static void APP_Meta_Confirm_Slot(void)
     return;
   }
 
+  /* min_sv (anti-rollback floor) is carried over untouched: the app only
+   * confirms the TRIAL state, it must never raise or lower the floor. */
   meta.state = META_STATE_IDLE;
-  meta.meta_crc = APP_CRC32_FOTA((const uint8_t *)&meta, 16U);
+  meta.meta_crc = APP_CRC32_FOTA((const uint8_t *)&meta, META_CRC_COVERED_LEN);
 
   HAL_FLASH_Unlock();
   EraseInit.TypeErase = FLASH_TYPEERASE_SECTORS;

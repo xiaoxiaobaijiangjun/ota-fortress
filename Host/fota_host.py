@@ -49,7 +49,7 @@ from pathlib import Path
 # Memory map & metadata
 # ---------------------------------------------------------------------------
 META_BASE = 0x08008000
-META_SIZE = 20                  # FOTA_Meta_t on flash
+META_SIZE = 24                  # FOTA_Meta_t on flash (v2: + min_sv)
 
 SLOT_A_BASE = 0x0800C000
 SLOT_A_SIZE = 0x34000           # sectors 3-5 (208 KB)
@@ -85,6 +85,7 @@ ACT_STATUS = {
     0x10: "no or malformed TLV signature trailer",
     0x11: "digest mismatch (image or security_version altered)",
     0x12: "ECDSA-P256 signature invalid",
+    0x13: "security version below minimum (anti-rollback)",
 }
 
 # ---------------------------------------------------------------------------
@@ -181,22 +182,22 @@ def _stm32_hw_crc_model(data: bytes) -> int:
 # ---------------------------------------------------------------------------
 # Metadata helpers
 # ---------------------------------------------------------------------------
-def meta_pack(active, state, image_len=0, image_crc=0) -> bytes:
-    """Serialize FOTA_Meta_t exactly like the C struct (20 bytes)."""
+def meta_pack(active, state, image_len=0, image_crc=0, min_sv=0) -> bytes:
+    """Serialize FOTA_Meta_t exactly like the C struct (24 bytes, v2)."""
     head = struct.pack("<IBBBB", META_MAGIC, META_VERSION, active, state, 0)
-    tail = struct.pack("<II", image_len, image_crc)
+    tail = struct.pack("<III", image_len, image_crc, min_sv)
     return head + tail + struct.pack("<I", crc32_fota(head + tail))
 
 
 def meta_unpack(raw: bytes):
     if len(raw) != META_SIZE or raw[0] == 0xFF:
         return None
-    magic, version, active, state, res, image_len, image_crc, meta_crc = struct.unpack("<IBBBBIII", raw)
+    magic, version, active, state, res, image_len, image_crc, min_sv, meta_crc = struct.unpack("<IBBBBIIII", raw)
     if magic != META_MAGIC or version != META_VERSION:
         return None
-    if crc32_fota(raw[:16]) != meta_crc:
+    if crc32_fota(raw[:20]) != meta_crc:
         return None
-    return dict(active=active, state=state, image_len=image_len, image_crc=image_crc)
+    return dict(active=active, state=state, image_len=image_len, image_crc=image_crc, min_sv=min_sv)
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +270,9 @@ class SimulatedSTM32:
         if public_pem is None and PUBLIC_KEY_PATH.exists():
             public_pem = PUBLIC_KEY_PATH.read_bytes()
         self.public_pem = public_pem
+        # Anti-rollback floor: mirrors FOTA_Meta_t.min_sv on the MCU. Raised
+        # on every successful activate, never lowered (rollbacks keep it).
+        self.min_sv = 0
 
     # -- wire interface -----------------------------------------------------
     def write(self, data: bytes) -> None:
@@ -297,10 +301,16 @@ class SimulatedSTM32:
         off = META_BASE - 0x08000000
         return meta_unpack(bytes(self.flash[off : off + META_SIZE]))
 
-    def _meta_write(self, active, state, image_len=0, image_crc=0):
+    def _meta_write(self, active, state, image_len=0, image_crc=0, min_sv=None):
+        """min_sv=None carries the current floor over (rollback / confirm
+        paths); only a successful activate passes an explicit (higher) value."""
         off = META_BASE - 0x08000000
+        if min_sv is None:
+            min_sv = self.min_sv
+        else:
+            self.min_sv = min_sv
         self.flash[off : off + 16 * 1024] = b"\xFF" * (16 * 1024)  # sector 2 erase
-        self.flash[off : off + META_SIZE] = meta_pack(active, state, image_len, image_crc)
+        self.flash[off : off + META_SIZE] = meta_pack(active, state, image_len, image_crc, min_sv)
 
     def confirm_app(self):
         """Simulate the app writing TRIAL -> IDLE after running healthy."""
@@ -449,33 +459,37 @@ class SimulatedSTM32:
                     idx = base - 0x08000000
                     calc = crc32_fota(bytes(self.flash[idx : idx + image_len]))
                     if calc == image_crc:
-                        status = self._verify_signed(idx, image_len)
+                        status, sv = self._verify_signed(idx, image_len)
+                        if status == 0x01 and sv < self.min_sv:
+                            # validly signed but older than the floor
+                            status = 0x13
                         if status == 0x01:
-                            self._meta_write(slot, META_STATE_TRIAL, image_len, image_crc)
+                            self._meta_write(slot, META_STATE_TRIAL, image_len, image_crc, min_sv=sv)
                             self.jumped = True
             self.tx.append(status)
         else:
             self.tx.append(NACK)
 
-    def _verify_signed(self, idx: int, image_len: int) -> int:
+    def _verify_signed(self, idx: int, image_len: int):
         """Mirror Bootloader_Verify_Signed_Image on the MCU: parse the TLV
         trailer stored right after the image, recompute the digest over
         image || security_version and check the ECDSA-P256 signature.
-        Returns the ACT_STATUS code (0x01 = success)."""
+        Returns (ACT_STATUS code, security_version); sv is 0 when the TLV
+        could not be parsed."""
         if idx + image_len + 6 > len(self.flash):
-            return 0x10
+            return 0x10, 0
         head = bytes(self.flash[idx + image_len : idx + image_len + 6])
         if head[:4] != fota_tlv.TLV_MAGIC:
-            return 0x10
+            return 0x10, 0
         (tlv_len,) = struct.unpack_from("<H", head, 4)
         probe = bytes(self.flash[idx + image_len : idx + image_len + 6 + tlv_len])
         parsed = fota_tlv._parse_at(probe, 0)
         if not parsed:
-            return 0x10
+            return 0x10, 0
         _, sv, digest, sig = parsed
         image = bytes(self.flash[idx : idx + image_len])
         if hashlib.sha256(image + struct.pack("<I", sv)).digest() != digest:
-            return 0x11
+            return 0x11, sv
         if self.public_pem:
             try:
                 import ecdsa
@@ -483,8 +497,8 @@ class SimulatedSTM32:
                 vk = ecdsa.VerifyingKey.from_pem(self.public_pem.decode())
                 vk.verify_digest(sig, digest, sigdecode=ecdsa.util.sigdecode_string)
             except Exception:
-                return 0x12
-        return 0x01
+                return 0x12, sv
+        return 0x01, sv
 
 
 # ---------------------------------------------------------------------------
@@ -725,12 +739,12 @@ def run_selftest() -> int:
     print("[PASS] FOTA CRC32 vector 123456789 -> 0x1556F485")
     print("[PASS] software CRC == STM32 hardware CRC model")
 
-    # 2) metadata pack/unpack round trip
+    # 2) metadata pack/unpack round trip (v2: 24 bytes with min_sv)
     raw = meta_pack(SLOT_A, META_STATE_TRIAL, 700, 0x12345678)
     assert len(raw) == META_SIZE
     meta = meta_unpack(raw)
-    assert meta == dict(active=SLOT_A, state=META_STATE_TRIAL, image_len=700, image_crc=0x12345678)
-    print("[PASS] metadata pack/unpack round trip (20 bytes)")
+    assert meta == dict(active=SLOT_A, state=META_STATE_TRIAL, image_len=700, image_crc=0x12345678, min_sv=0)
+    print("[PASS] metadata pack/unpack round trip (24 bytes, v2)")
 
     # The simulator mirrors the production bootloader (BL_REQUIRE_SIGNED_IMAGES):
     # unsigned images and bad signatures are rejected, so every success path
@@ -901,6 +915,39 @@ def run_selftest() -> int:
         sim.confirm_app()
         assert client.get_slot_status() == (SLOT_A, META_STATE_IDLE, len(app_bin))
         print("[PASS] One-shot update() flow (reboot -> erase -> upload -> activate)")
+
+    # 15) anti-rollback floor (feature B): min_sv rises with each activation,
+    # an older-but-validly-signed image is rejected, and rollbacks never
+    # lower the floor (rollback != downgrade attack)
+    pkg_b2 = signed(fw_b, sv=2)
+    assert client.erase_slot(SLOT_B) == "Erase Success"
+    assert client.upload(pkg_b2.blob, SLOT_B) == "Upload Success (618 bytes in 10 chunks)"
+    assert client.activate(pkg_b2, SLOT_B) == "Activate Success (CRC + signature verified, jumping...)"
+    sim.confirm_app()
+    assert sim.min_sv == 2
+    print("[PASS] Activating sv=2 raises the anti-rollback floor to 2")
+
+    pkg_a1 = signed(fw_a, sv=1)   # attacker replays an older, validly-signed image
+    assert client.erase_slot(SLOT_A) == "Erase Success"
+    assert client.upload(pkg_a1.blob, SLOT_A) == "Upload Success (818 bytes in 13 chunks)"
+    r = client.activate(pkg_a1, SLOT_A)
+    assert r == "Activate Failed: security version below minimum (anti-rollback)", r
+    print("[PASS] Replay of older signed image (sv=1 < min_sv=2) -> rejected 0x13")
+
+    # rollback != downgrade: an unconfirmed TRIAL rolls the slot back, the
+    # floor survives, and the old image is still blocked afterwards
+    pkg_a2 = signed(fw_a, sv=2)
+    assert client.erase_slot(SLOT_A) == "Erase Success"
+    assert client.upload(pkg_a2.blob, SLOT_A) == "Upload Success (818 bytes in 13 chunks)"
+    assert client.activate(pkg_a2, SLOT_A) == "Activate Success (CRC + signature verified, jumping...)"
+    assert sim.power_cycle() is True                               # unconfirmed -> rolls back to B
+    assert client.get_slot_status()[0] == SLOT_B
+    assert sim.min_sv == 2
+    assert client.erase_slot(SLOT_A) == "Erase Success"
+    assert client.upload(pkg_a1.blob, SLOT_A) == "Upload Success (818 bytes in 13 chunks)"
+    r = client.activate(pkg_a1, SLOT_A)
+    assert r == "Activate Failed: security version below minimum (anti-rollback)", r
+    print("[PASS] Rollback does not lower the floor (min_sv stays 2 after TRIAL rollback)")
 
     print("\nAll self-tests passed.")
     return 0

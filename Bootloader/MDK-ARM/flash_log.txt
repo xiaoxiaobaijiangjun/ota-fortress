@@ -1,0 +1,3 @@
+Load "D:\\code\\STM32\\FOTA_STM32_Resume\\Bootloader\\MDK-ARM\\Objects\\FOTA_Bootloader.axf" 
+Error: Flash Download failed  -  Target DLL has been cancelled
+Flash Load finished at 12:24:59

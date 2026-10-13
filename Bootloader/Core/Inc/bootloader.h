@@ -56,6 +56,7 @@
 #define BL_ACT_FAIL_NO_TLV              0x10U  /* signature trailer missing or malformed   */
 #define BL_ACT_FAIL_DIGEST              0x11U  /* recomputed digest != trailer digest      */
 #define BL_ACT_FAIL_SIGNATURE           0x12U  /* ECDSA-P256 verification failed           */
+#define BL_ACT_FAIL_SEC_VERSION         0x13U  /* security_version below min_sv floor      */
 
 /*************************************  CRC Verification  *************************************/
 #define CRC_TYPE_SIZE_BYTE               4
