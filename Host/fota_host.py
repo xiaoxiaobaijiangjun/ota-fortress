@@ -927,6 +927,12 @@ def main() -> int:
     parser.add_argument("--seconds", type=float, default=10.0, help="monitor duration in seconds (default 10)")
     parser.add_argument("--slot", choices=["A", "B"], default="A", help="target slot (default A)")
     parser.add_argument(
+        "--force",
+        action="store_true",
+        help="skip the host-side package pre-check and let the MCU decide "
+        "(for negative tests: tampered packages are rejected by the bootloader)",
+    )
+    parser.add_argument(
         "command",
         nargs="?",
         help="id | rdp | status | erase | upload <bin> | activate <bin> | jump | update <bin> | reboot | crc <bin> | list | selftest",
@@ -988,7 +994,10 @@ def main() -> int:
                 print("usage: fota_host.py activate <file.bin> [--slot A|B]")
                 return 2
             fw = FirmwareFile(open(args.file, "rb").read())
-            preverify(fw)
+            if args.force:
+                fw.note = f"host pre-check SKIPPED (--force), sv={fw.sv}"
+            else:
+                preverify(fw)
             print(fw.note)
             print(client.activate(fw, slot))
         elif args.command == "update":
@@ -996,7 +1005,10 @@ def main() -> int:
                 print("usage: fota_host.py update <file.bin> [--slot A|B]")
                 return 2
             fw = FirmwareFile(open(args.file, "rb").read())
-            preverify(fw)
+            if args.force:
+                fw.note = f"host pre-check SKIPPED (--force), sv={fw.sv}"
+            else:
+                preverify(fw)
             print(fw.note)
             print(client.update(fw, slot))
         elif args.command == "reboot":
