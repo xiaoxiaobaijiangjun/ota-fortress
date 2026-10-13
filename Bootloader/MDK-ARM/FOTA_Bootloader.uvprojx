@@ -424,6 +424,11 @@
               <FilePath>..\Core\Src\image_tlv.c</FilePath>
             </File>
             <File>
+              <FileName>can_transport.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\can_transport.c</FilePath>
+            </File>
+            <File>
               <FileName>gpio.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Core\Src\gpio.c</FilePath>
@@ -522,6 +527,11 @@
               <FileName>stm32f4xx_hal_crc.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Drivers\STM32F4xx_HAL_Driver\Src\stm32f4xx_hal_crc.c</FilePath>
+            </File>
+            <File>
+              <FileName>stm32f4xx_hal_can.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Drivers\STM32F4xx_HAL_Driver\Src\stm32f4xx_hal_can.c</FilePath>
             </File>
             <File>
               <FileName>stm32f4xx_hal_uart.c</FileName>

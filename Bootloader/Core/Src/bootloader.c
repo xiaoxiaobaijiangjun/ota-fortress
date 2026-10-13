@@ -15,6 +15,7 @@
 #include "image_tlv.h"
 #include "uECC.h"
 #include "bootloader_key.h"
+#include "can_transport.h"
 
 /************************************    Static Functions Decelerations  ************************************/
 static void Bootloader_Get_Chip_Identification_Number(uint8_t *Host_Buffer);
@@ -26,10 +27,11 @@ static void Bootloader_Get_Slot_Status(uint8_t *Host_Buffer);
 static void Bootloader_Erase_Slot(uint8_t *Host_Buffer);
 static void Bootloader_Activate(uint8_t *Host_Buffer);
 
-static uint8_t Bootloader_CRC_Verify(uint8_t *pData, uint32_t Data_Len, uint32_t Host_CRC);
-static uint32_t Bootloader_CRC_Calculate(const uint8_t *pData, uint32_t Data_Len);
+uint8_t Bootloader_CRC_Verify(uint8_t *pData, uint32_t Data_Len, uint32_t Host_CRC);
+uint32_t Bootloader_CRC_Calculate(const uint8_t *pData, uint32_t Data_Len);
 static void Bootloader_Send_NACK(void);
 static void Bootloader_Send_Data_To_Host(uint8_t *Host_Buffer, uint32_t Data_Len);
+static void BL_Send_Raw(const uint8_t *pData, uint32_t Data_Len);
 static uint8_t Host_Address_Verification(uint32_t Jump_Address, uint16_t Payload_Len);
 static uint8_t Perform_Flash_Erase(uint8_t Sector_Numebr, uint8_t Number_Of_Sectors);
 
@@ -43,7 +45,7 @@ static void Bootloader_Jump_To_App_At(uint32_t base);
 static uint8_t Bootloader_Resolve_Boot_Slot(void);
 static uint8_t Bootloader_Image_CRC_Verify(uint32_t base_addr, uint32_t image_len, uint32_t expected);
 static void BL_IWDG_Start(void);
-static void BL_IWDG_Refresh(void);
+void BL_IWDG_Refresh(void);
 #if BL_REQUIRE_SIGNED_IMAGES
 static uint8_t Bootloader_Verify_Signed_Image(uint32_t base, uint32_t image_len, uint32_t slot_end,
                                                uint32_t *sv_out, uint32_t *verify_ms_out);
@@ -54,22 +56,60 @@ static const char *BL_Act_Reason(uint8_t status);
 /************************************    Global Variables Definitions     ************************************/
 static uint8_t BL_Host_Buffer[BL_HOST_BUFFER_RX_LENGTH];
 
+/* Which carrier carries the CURRENT command's replies. Set by the transport
+ * that received the packet (UART / CAN) before dispatch; "swap the physical
+ * layer, keep the protocol layer". */
+static uint8_t BL_Cmd_Transport_Is_CAN = 0U;
+
+void BL_Set_Transport(uint8_t is_can)
+{
+	BL_Cmd_Transport_Is_CAN = is_can;
+}
+
+static void BL_Send_Raw(const uint8_t *pData, uint32_t Data_Len)
+{
+	if(BL_Cmd_Transport_Is_CAN)
+	{
+		(void)BL_CAN_Send_Packet(pData, (uint16_t)Data_Len);
+	}
+	else
+	{
+		(void)HAL_UART_Transmit(BL_HOST_COMMUNICATION_UART, (uint8_t *)pData, Data_Len, HAL_MAX_DELAY);
+	}
+}
+
 /************************************ Software Interfaces Implementations ************************************/
 void BL_Boot_Entry(void)
 {
 	uint8_t first_byte = 0;
+	uint32_t window_start;
 
 	/* A previous app boot may have left the IWDG running: keep it fed. */
 	BL_IWDG_Refresh();
 
-	/* Small UART window after reset: if the HOST sends a byte we stay in
-	 * update mode, otherwise we auto-boot the active application slot. */
-	if(HAL_UART_Receive(BL_HOST_COMMUNICATION_UART, &first_byte, 1, BL_AUTOBOOT_WINDOW_MS) == HAL_OK)
+	/* Bring up the CAN transport (loopback in C1, real bus in C2). */
+	BL_CAN_Init();
+
+	/* Small window after reset: if the HOST sends a UART byte we stay in
+	 * update mode on the UART; if CAN frames arrive we serve them; otherwise
+	 * we auto-boot the active application slot. CAN activity extends the
+	 * window so a full CAN session never times out mid-update. */
+	window_start = HAL_GetTick();
+	while((HAL_GetTick() - window_start) < BL_AUTOBOOT_WINDOW_MS)
 	{
-		(void)BL_UART_Process_Host_Command(first_byte);
-		while (1)
+		BL_IWDG_Refresh();
+		if(HAL_UART_Receive(BL_HOST_COMMUNICATION_UART, &first_byte, 1, 10) == HAL_OK)
 		{
-			BL_UART_Fetch_Host_Command();
+			(void)BL_UART_Process_Host_Command(first_byte);
+			while (1)
+			{
+				BL_UART_Fetch_Host_Command();
+			}
+		}
+		if(BL_CAN_Activity())
+		{
+			BL_CAN_Service();
+			window_start = HAL_GetTick();
 		}
 	}
 
@@ -139,46 +179,68 @@ BL_Status BL_UART_Process_Host_Command(uint8_t first_byte)
 		}
 		else
 		{
-			switch(BL_Host_Buffer[1]){
-				case CBL_GET_CID_CMD:
-					Bootloader_Get_Chip_Identification_Number(BL_Host_Buffer);
-					Status = BL_OK;
-					break;
-				case CBL_GET_RDP_STATUS_CMD:
-					Bootloader_Read_Protection_Level(BL_Host_Buffer);
-					Status = BL_OK;
-					break;
-				case CBL_GO_TO_ADDR_CMD:
-					Bootloader_Jump_To_User_App(BL_Host_Buffer);
-					Status = BL_OK;
-					break;
-				case CBL_FLASH_ERASE_CMD:
-					Bootloader_Erase_Flash(BL_Host_Buffer);
-					Status = BL_OK;
-					break;
-				case CBL_MEM_WRITE_CMD:
-					Bootloader_Memory_Write(BL_Host_Buffer);
-					Status = BL_OK;
-					break;
-				case CBL_GET_SLOT_STATUS_CMD:
-					Bootloader_Get_Slot_Status(BL_Host_Buffer);
-					Status = BL_OK;
-					break;
-				case CBL_ERASE_SLOT_CMD:
-					Bootloader_Erase_Slot(BL_Host_Buffer);
-					Status = BL_OK;
-					break;
-				case CBL_ACTIVATE_CMD:
-					Bootloader_Activate(BL_Host_Buffer);
-					Status = BL_OK;
-					break;
-				default:
-					/* Unknown command: reject the packet */
-					Bootloader_Send_NACK();
-					Status = BL_NACK;
-					break;
-			}
+			Status = BL_Process_Packet(BL_Host_Buffer);
 		}
+	}
+
+	return Status;
+}
+
+/* Protocol layer, carrier agnostic: the packet [len][cmd][payload][crc32] is
+ * fully reassembled in memory by whichever transport delivered it (UART body
+ * read above, CAN ISO-TP reassembly in can_transport.c). All handlers and
+ * the upgrade state machine live below this line, unchanged for both. */
+BL_Status BL_Process_Packet(const uint8_t *Host_Buffer)
+{
+	BL_Status Status = BL_NACK;
+
+	switch(Host_Buffer[1]){
+		case CBL_GET_CID_CMD:
+			Bootloader_Get_Chip_Identification_Number((uint8_t *)Host_Buffer);
+			Status = BL_OK;
+			break;
+		case CBL_GET_RDP_STATUS_CMD:
+			Bootloader_Read_Protection_Level((uint8_t *)Host_Buffer);
+			Status = BL_OK;
+			break;
+		case CBL_GO_TO_ADDR_CMD:
+			Bootloader_Jump_To_User_App((uint8_t *)Host_Buffer);
+			Status = BL_OK;
+			break;
+		case CBL_FLASH_ERASE_CMD:
+			Bootloader_Erase_Flash((uint8_t *)Host_Buffer);
+			Status = BL_OK;
+			break;
+		case CBL_MEM_WRITE_CMD:
+			Bootloader_Memory_Write((uint8_t *)Host_Buffer);
+			Status = BL_OK;
+			break;
+		case CBL_GET_SLOT_STATUS_CMD:
+			Bootloader_Get_Slot_Status((uint8_t *)Host_Buffer);
+			Status = BL_OK;
+			break;
+		case CBL_ERASE_SLOT_CMD:
+			Bootloader_Erase_Slot((uint8_t *)Host_Buffer);
+			Status = BL_OK;
+			break;
+		case CBL_ACTIVATE_CMD:
+			Bootloader_Activate((uint8_t *)Host_Buffer);
+			Status = BL_OK;
+			break;
+#if BL_CAN_LOOPBACK_TEST
+		case CBL_CAN_INJECT_CMD:
+			/* Test harness: put one CAN frame on the (looping-back) bus and
+			 * service it synchronously. Replies come back as forwarded CAN
+			 * frames on the UART - this command itself never answers. */
+			(void)BL_CAN_Inject_And_Service(&((uint8_t *)Host_Buffer)[2]);
+			Status = BL_OK;
+			break;
+#endif
+		default:
+			/* Unknown command: reject the packet */
+			Bootloader_Send_NACK();
+			Status = BL_NACK;
+			break;
 	}
 
 	return Status;
@@ -752,7 +814,7 @@ static void BL_Log(const char *fmt, ...)
 		{
 			n = (int)(sizeof(log_buf) - 1U);
 		}
-		(void)HAL_UART_Transmit(BL_HOST_COMMUNICATION_UART, (uint8_t *)log_buf, (uint32_t)n, HAL_MAX_DELAY);
+		BL_Send_Raw((const uint8_t *)log_buf, (uint32_t)n);
 	}
 }
 
@@ -956,12 +1018,12 @@ static uint8_t Host_Address_Verification(uint32_t Jump_Address, uint16_t Payload
 	return Address_Verification;
 }
 
-static uint8_t Bootloader_CRC_Verify(uint8_t *pData, uint32_t Data_Len, uint32_t Host_CRC)
+uint8_t Bootloader_CRC_Verify(uint8_t *pData, uint32_t Data_Len, uint32_t Host_CRC)
 {
 	return (Bootloader_CRC_Calculate(pData, Data_Len) == Host_CRC) ? CRC_VERIFICATION_PASSED : CRC_VERIFICATION_FAILED;
 }
 
-static uint32_t Bootloader_CRC_Calculate(const uint8_t *pData, uint32_t Data_Len)
+uint32_t Bootloader_CRC_Calculate(const uint8_t *pData, uint32_t Data_Len)
 {
 	uint32_t MCU_CRC_Calculated = 0;
 	uint32_t Data_Buffer = 0;
@@ -982,12 +1044,12 @@ static uint32_t Bootloader_CRC_Calculate(const uint8_t *pData, uint32_t Data_Len
 static void Bootloader_Send_NACK(void)
 {
 	uint8_t Ack_Value = CBL_SEND_NACK;
-	HAL_UART_Transmit(BL_HOST_COMMUNICATION_UART, &Ack_Value, 1, HAL_MAX_DELAY);
+	BL_Send_Raw(&Ack_Value, 1);
 }
 
 static void Bootloader_Send_Data_To_Host(uint8_t *Host_Buffer, uint32_t Data_Len)
 {
-	HAL_UART_Transmit(BL_HOST_COMMUNICATION_UART, Host_Buffer, Data_Len, HAL_MAX_DELAY);
+	BL_Send_Raw(Host_Buffer, Data_Len);
 }
 
 /************************************    IWDG (Independent Watchdog)    ************************************/
@@ -1003,7 +1065,7 @@ static void BL_IWDG_Start(void)
 	IWDG->KR = 0xCCCCU;                         /* start (only has effect once) */
 }
 
-static void BL_IWDG_Refresh(void)
+void BL_IWDG_Refresh(void)
 {
 	/* Reload the counter; harmless when the watchdog is not running. */
 	IWDG->KR = BL_IWDG_REFRESH_KEY;

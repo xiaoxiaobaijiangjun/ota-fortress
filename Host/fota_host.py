@@ -21,6 +21,10 @@ an ESP32, Firebase or Node-RED:
     python tools/keygen.py                 # once: keypair + Bootloader key header
     python tools/sign.py <image>.bin --sv 1 -o <image>_signed.bin
 
+    # CAN transport (C1 loopback tunnel - same USB-TTL wiring, no CAN hardware):
+    python fota_host.py --port COM5 --can-bridge status
+    python fota_host.py --port COM5 --can-bridge --slot B update <image>_signed.bin
+
     # protocol self-test against a simulated bootloader (no hardware needed)
     python fota_host.py selftest
 
@@ -95,6 +99,7 @@ ACT_STATUS = {
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import fota_tlv  # noqa: E402  (tools/fota_tlv.py)
+import isotp  # noqa: E402  (tools/isotp.py - CAN transport segmentation)
 
 PUBLIC_KEY_PATH = Path(__file__).resolve().parent.parent / "tools" / "fota_public.pem"
 
@@ -251,6 +256,123 @@ class SerialTransport:
 
     def close(self) -> None:
         self.ser.close()
+
+
+class CanBridgeTransport:
+    """C1 loopback test harness: the firmware's CAN stack (bxCAN loopback +
+    ISO-TP) is driven through a UART frame tunnel, so the full CAN path runs
+    on the real MCU with only the USB-TTL wired:
+
+        host -> MCU : [13][0x1C][8-byte CAN frame][crc32]  (inject, no reply)
+        MCU  -> host: [13][0x1D][8-byte CAN frame][crc32]  (forwarded TX)
+
+    Presents the same write()/read() surface as SerialTransport, so every
+    FOTAClient flow works unchanged. For C2 (real bus) this class is replaced
+    by a python-can based transport with the same surface."""
+
+    def __init__(self, port: str, baud: int):
+        import serial
+
+        self.ser = serial.Serial(port, baud, timeout=0.5)
+        self.ser.reset_input_buffer()
+        self.ser.reset_output_buffer()
+        time.sleep(0.1)
+        self._rx = isotp.Receiver(send_fc=self._send_frame)
+        self._data = bytearray()
+        self._buf = bytearray()
+
+    def close(self) -> None:
+        self.ser.close()
+
+    def write_raw(self, raw: bytes) -> None:
+        """Raw UART bytes outside the tunnel (e.g. the app reboot magic)."""
+        self.ser.write(raw)
+        self.ser.flush()
+
+    @staticmethod
+    def _tunnel_packet(cmd: int, frame: bytes) -> bytes:
+        head = bytes([13, cmd]) + frame
+        return head + struct.pack("<I", crc32_fota(head))
+
+    def _send_frame(self, frame: bytes) -> None:
+        self.ser.write(self._tunnel_packet(0x1C, frame))
+        self.ser.flush()
+
+    def _parse(self) -> None:
+        """Extract 0x1D tunnel packets from the raw UART stream and feed the
+        ISO-TP receiver; completed packets land in self._data."""
+        while True:
+            if len(self._buf) < 2:
+                return
+            length = self._buf[0]
+            if not (2 <= length <= 99):
+                del self._buf[0]  # resync (boot banner text etc.)
+                continue
+            if len(self._buf) < length + 1:
+                return
+            pkt = bytes(self._buf[: length + 1])
+            del self._buf[: length + 1]
+            if crc32_fota(pkt[:-4]) != struct.unpack("<I", pkt[-4:])[0]:
+                continue
+            if pkt[1] == 0x1D:
+                self._rx.feed(pkt[2:10])
+                if self._rx.packet is not None:
+                    self._data += self._rx.packet
+                    self._rx.packet = None
+
+    def _pump(self, deadline_s: float) -> None:
+        end = time.time() + deadline_s
+        while time.time() < end:
+            chunk = self.ser.read(256)
+            if chunk:
+                self._buf += chunk
+                self._parse()
+
+    def _wait_fc(self, deadline_s: float = 2.0):
+        """Wait for the MCU's flow-control frame (forwarded on the tunnel)."""
+        self._rx.last_fc = None
+        self._pump(deadline_s)
+        if self._rx.last_fc is None:
+            raise RuntimeError("timeout waiting for CAN flow control frame")
+        fc = self._rx.last_fc
+        self._rx.last_fc = None
+        return fc
+
+    def write(self, packet: bytes) -> None:
+        frames = isotp.segment(packet)
+        bs, stmin = isotp.FC_BS, isotp.FC_STMIN
+        cf_count = 0
+        for i, fr in enumerate(frames):
+            self._send_frame(fr)
+            if i == 0 and len(frames) > 1:
+                bs, stmin = self._wait_fc()
+                continue
+            if i > 0:
+                cf_count += 1
+                if bs and cf_count >= bs and i + 1 < len(frames):
+                    bs, stmin = self._wait_fc()
+                    cf_count = 0
+            if stmin:
+                time.sleep(stmin / 1000.0)
+
+    def read(self, n: int) -> bytes:
+        deadline_s = 20.0  # activate verifies CRC+SHA+ECDSA on the MCU first
+        end = time.time() + deadline_s
+        while len(self._data) < n and time.time() < end:
+            chunk = self.ser.read(256)
+            if chunk:
+                self._buf += chunk
+                self._parse()
+        out = bytes(self._data[:n])
+        del self._data[:n]
+        return out
+
+    def drain_text(self, timeout_s: float) -> str:
+        """Collect pending payload bytes (e.g. MCU log lines) as text."""
+        self._pump(timeout_s)
+        out = bytes(self._data)
+        self._data.clear()
+        return out.decode("ascii", errors="replace")
 
 
 class SimulatedSTM32:
@@ -519,6 +641,12 @@ class FOTAClient:
         """_send, then drain any log text the MCU emits AFTER the reply byte
         (activate sends its status first, then a human-readable line)."""
         reply = self._send(packet, reply_len)
+        if hasattr(self.t, "drain_text"):
+            text = self.t.drain_text(0.5)
+            if text:
+                sys.stdout.write(text)
+                sys.stdout.flush()
+            return reply
         ser = getattr(self.t, "ser", None)
         if ser is not None:
             old_timeout = ser.timeout
@@ -639,7 +767,10 @@ class FOTAClient:
         running app just reset) so the NEXT command never reads a stale byte
         as its own reply.
         """
-        self.t.write(bytes([APP_REBOOT_MAGIC]))
+        if hasattr(self.t, "write_raw"):
+            self.t.write_raw(bytes([APP_REBOOT_MAGIC]))
+        else:
+            self.t.write(bytes([APP_REBOOT_MAGIC]))
         if isinstance(self.t, SerialTransport):
             old_timeout = self.t.ser.timeout
             # The banner/NACK arrives within a few ms; keep the drain short so
@@ -670,6 +801,8 @@ class FOTAClient:
 def build_transport(args):
     if args.sim:
         return SimulatedSTM32()
+    if getattr(args, "can_bridge", False):
+        return CanBridgeTransport(args.port, args.baud)
     return SerialTransport(args.port, args.baud)
 
 
@@ -949,6 +1082,38 @@ def run_selftest() -> int:
     assert r == "Activate Failed: security version below minimum (anti-rollback)", r
     print("[PASS] Rollback does not lower the floor (min_sv stays 2 after TRIAL rollback)")
 
+    # 16) ISO-TP segmentation (CAN transport, protocol level - mirrors
+    # Bootloader/Core/Src/can_transport.c)
+    for size in (1, 7, 8, 20, 64, 75, 112):
+        pkt = bytes((i * 31 + 7) & 0xFF for i in range(size))
+        frames = isotp.segment(pkt)
+        rcv = isotp.Receiver()
+        for fr in frames:
+            rcv.feed(fr)
+        assert rcv.packet == pkt, f"roundtrip failed at {size} bytes"
+    print("[PASS] ISO-TP segment/reassemble round trip (7 sizes, SF and FF/CF)")
+
+    fcs = []
+    rcv = isotp.Receiver(send_fc=fcs.append)
+    big = bytes((i * 13 + 5) & 0xFF for i in range(75))
+    for fr in isotp.segment(big):
+        rcv.feed(fr)
+    assert rcv.packet == big
+    # 75 bytes = FF + 10 CFs -> FC on FF and one mid-stream (BS = 8)
+    assert len(fcs) == 2 and all(f[0] == 0x30 and f[1] == 8 and f[2] == 1 for f in fcs), fcs
+    print("[PASS] ISO-TP flow control emitted on FF and after every BS frames")
+
+    # sequence error aborts the reception (mirrors the MCU FSM)
+    rcv = isotp.Receiver()
+    frames = isotp.segment(bytes(range(40)))
+    for fr in frames[:-1]:
+        rcv.feed(fr)
+    last = bytearray(frames[-1])
+    last[0] ^= 0x01  # corrupt the sequence number
+    rcv.feed(bytes(last))
+    assert rcv.packet is None
+    print("[PASS] ISO-TP sequence error aborts the multi-frame reception")
+
     print("\nAll self-tests passed.")
     return 0
 
@@ -971,6 +1136,11 @@ def main() -> int:
     parser.add_argument("--port", default="COM5", help="serial port (e.g. COM5)")
     parser.add_argument("--baud", type=int, default=115200)
     parser.add_argument("--sim", action="store_true", help="use simulated bootloader instead of serial port")
+    parser.add_argument(
+        "--can-bridge",
+        action="store_true",
+        help="drive the CAN transport through the UART loopback tunnel (C1: no CAN hardware needed)",
+    )
     parser.add_argument("--seconds", type=float, default=10.0, help="monitor duration in seconds (default 10)")
     parser.add_argument("--slot", choices=["A", "B"], default="A", help="target slot (default A)")
     parser.add_argument(

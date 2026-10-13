@@ -43,6 +43,7 @@
 #define CBL_GET_SLOT_STATUS_CMD          0x15  /* Get active slot / state / image length       */
 #define CBL_ERASE_SLOT_CMD               0x16  /* Erase slot A (0) or B (1)                    */
 #define CBL_ACTIVATE_CMD                 0x17  /* Verify whole image CRC, set TRIAL, jump      */
+#define CBL_CAN_INJECT_CMD               0x1C  /* TEST: inject one CAN frame (loopback builds) */
 
 /*************************************  Signed Images  ******************************************/
 /* 1 = production: ACTIVATE rejects any package without a valid TLV signature trailer.
@@ -128,6 +129,11 @@ typedef void (*Jump_Ptr)(void);
 void BL_Boot_Entry(void);
 BL_Status BL_UART_Fetch_Host_Command(void);
 BL_Status BL_UART_Process_Host_Command(uint8_t first_byte);
+BL_Status BL_Process_Packet(const uint8_t *Host_Buffer);
+void BL_Set_Transport(uint8_t is_can);
 void Bootloader_Jump_To_Active_App(void);
+void BL_IWDG_Refresh(void);
+uint8_t Bootloader_CRC_Verify(uint8_t *pData, uint32_t Data_Len, uint32_t Host_CRC);
+uint32_t Bootloader_CRC_Calculate(const uint8_t *pData, uint32_t Data_Len);
 
 #endif /* BOOTLOADER_H_ */
