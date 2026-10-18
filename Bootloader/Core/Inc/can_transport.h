@@ -34,8 +34,9 @@
 #define BL_CAN_REQ_ID               0x6E0U
 #define BL_CAN_RSP_ID               0x6E1U
 
-/* C1 loopback test harness (set 0 for the C2 real-bus build) */
-#define BL_CAN_LOOPBACK_TEST        1U
+/* C1 loopback test harness; C2 real-bus default. Flip to 1U only to rerun the
+ * on-device loopback harness (C1 evidence is archived under 02-实验记录). */
+#define BL_CAN_LOOPBACK_TEST        0U
 
 /* UART tunnel commands (only exist in loopback-test builds) */
 #define CBL_CAN_INJECT_CMD          0x1C  /* host -> MCU: inject one CAN frame   */
