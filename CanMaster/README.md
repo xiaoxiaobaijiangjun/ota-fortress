@@ -19,13 +19,14 @@
 
 500 kbps：APB1 36 MHz ÷4 = 9 MHz，1+15+2=18 tq，采样点 88.9%（F407 侧 87.5%，同标称速率互操作）。
 
-## 构建 / 烧录（CubeIDE）
+## 构建 / 烧录（Keil，主用）
 
-1. File → Import → Existing Projects into Workspace → 选 `CanMaster` 目录
-2. Project → Build（期望 0 错；首次构建会编译整个 HAL 树，稍慢）
-3. Run → 用 ST-Link 下载（或 OpenOCD/STM32CubeProgrammer）
+1. Keil 打开 `MDK-ARM\CanMaster.uvprojx`（AC5 -O1 + MicroLib，ST-Link 已配好）
+2. F7 Rebuild（2026-10-18 已验证 **0 错 0 警**，Code 6358B；HEX 在 `MDK-ARM\Objects\CanMaster.hex`）
+3. F8 下载（ST-Link 四线：3V3/SWDIO/SWCLK/GND，板自供电时 3V3 可不接）
 
-本机无 ARM 工具链，首次构建若有编译错误把贴报错给 AI 修。
+备用路线：CubeIDE Import 本目录（Core/Drivers 布局兼容；syscalls.c/sysmem.c 仅 CubeIDE 用）。
+依赖：Keil STM32F1xx_DFP 2.3.0（已装入 C:\Keil_v5）。
 
 ## C2 联调流程（前置：F407 侧也要重烧一次）
 

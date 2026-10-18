@@ -42,10 +42,10 @@ void can_bare_init(void)
 	can_gpio_init();
 
 	/* enter init mode */
-	CAN->MCR &= ~(CAN_MCR_SLEEP | CAN_MCR_DBF);
-	CAN->MCR |= CAN_MCR_INRQ;
+	CAN1->MCR &= ~(CAN_MCR_SLEEP | CAN_MCR_DBF);
+	CAN1->MCR |= CAN_MCR_INRQ;
 	t0 = HAL_GetTick();
-	while((CAN->MSR & CAN_MSR_INAK) == 0U)
+	while((CAN1->MSR & CAN_MSR_INAK) == 0U)
 	{
 		if((HAL_GetTick() - t0) > 10U)
 		{
@@ -53,27 +53,27 @@ void can_bare_init(void)
 		}
 	}
 
-	CAN->MCR = CAN_MCR_ABOM            /* auto bus-off recovery */
+	CAN1->MCR = CAN_MCR_ABOM            /* auto bus-off recovery */
 	         | CAN_MCR_INRQ;           /* NART=0 -> auto retransmission */
-	CAN->BTR = ((0U) << 24)            /* SJW = 1 tq */
+	CAN1->BTR = ((0U) << 24)            /* SJW = 1 tq */
 	         | ((1U) << 20)            /* TS2 = 2 tq */
 	         | ((14U) << 16)           /* TS1 = 15 tq */
 	         | (3U);                   /* BRP = 4  -> 36/4 = 9 MHz, 18 tq = 500 kbps */
 
 	/* filter bank 0: 16-bit id list, accept only 0x6E1 into FIFO0 */
-	CAN->FMR |= CAN_FMR_FINIT;
-	CAN->FM1R |= CAN_FM1R_FMBM0;                       /* list mode */
-	CAN->FS1R &= ~CAN_FS1R_FSCB0;                      /* 16-bit scale */
-	CAN->FFA1R &= ~CAN_FFA1R_FFA0;                     /* FIFO0 */
-	CAN->sFilterRegister[0].FR1 = ((uint32_t)(CANM_RSP_ID << 5) << 16) | (uint32_t)(CANM_RSP_ID << 5);
-	CAN->sFilterRegister[0].FR2 = ((uint32_t)(CANM_RSP_ID << 5) << 16) | (uint32_t)(CANM_RSP_ID << 5);
-	CAN->FA1R |= CAN_FA1R_FACT0;
-	CAN->FMR &= ~CAN_FMR_FINIT;
+	CAN1->FMR |= CAN_FMR_FINIT;
+	CAN1->FM1R |= CAN_FM1R_FBM0;                       /* list mode */
+	CAN1->FS1R &= ~CAN_FS1R_FSC0;                      /* 16-bit scale */
+	CAN1->FFA1R &= ~CAN_FFA1R_FFA0;                     /* FIFO0 */
+	CAN1->sFilterRegister[0].FR1 = ((uint32_t)(CANM_RSP_ID << 5) << 16) | (uint32_t)(CANM_RSP_ID << 5);
+	CAN1->sFilterRegister[0].FR2 = ((uint32_t)(CANM_RSP_ID << 5) << 16) | (uint32_t)(CANM_RSP_ID << 5);
+	CAN1->FA1R |= CAN_FA1R_FACT0;
+	CAN1->FMR &= ~CAN_FMR_FINIT;
 
 	/* leave init mode -> peripheral goes on the bus */
-	CAN->MCR &= ~CAN_MCR_INRQ;
+	CAN1->MCR &= ~CAN_MCR_INRQ;
 	t0 = HAL_GetTick();
-	while((CAN->MSR & CAN_MSR_INAK) != 0U)
+	while((CAN1->MSR & CAN_MSR_INAK) != 0U)
 	{
 		if((HAL_GetTick() - t0) > 10U)
 		{
@@ -94,7 +94,7 @@ uint8_t can_bare_send(uint32_t std_id, const uint8_t d[8])
 
 	for(mb = 0U; mb < 3U; mb++)
 	{
-		if((CAN->TSR & tme_bit[mb]) != 0U)
+		if((CAN1->TSR & tme_bit[mb]) != 0U)
 		{
 			break;
 		}
@@ -105,23 +105,23 @@ uint8_t can_bare_send(uint32_t std_id, const uint8_t d[8])
 		return 0U;
 	}
 
-	CAN->sTxMailBox[mb].TDLR = (uint32_t)d[0] | ((uint32_t)d[1] << 8) | ((uint32_t)d[2] << 16) | ((uint32_t)d[3] << 24);
-	CAN->sTxMailBox[mb].TDHR = (uint32_t)d[4] | ((uint32_t)d[5] << 8) | ((uint32_t)d[6] << 16) | ((uint32_t)d[7] << 24);
-	CAN->sTxMailBox[mb].TDTR = 8U;
-	CAN->sTxMailBox[mb].TIR  = (std_id << CAN_TI0R_STID_Pos) | CAN_TI0R_TXRQ;
+	CAN1->sTxMailBox[mb].TDLR = (uint32_t)d[0] | ((uint32_t)d[1] << 8) | ((uint32_t)d[2] << 16) | ((uint32_t)d[3] << 24);
+	CAN1->sTxMailBox[mb].TDHR = (uint32_t)d[4] | ((uint32_t)d[5] << 8) | ((uint32_t)d[6] << 16) | ((uint32_t)d[7] << 24);
+	CAN1->sTxMailBox[mb].TDTR = 8U;
+	CAN1->sTxMailBox[mb].TIR  = (std_id << CAN_TI0R_STID_Pos) | CAN_TI0R_TXRQ;
 
 	/* 20 ms: a 500 kbps frame needs ~0.25 ms; anything longer means no ACK */
 	t0 = HAL_GetTick();
-	while((CAN->TSR & rqcp_bit[mb]) == 0U)
+	while((CAN1->TSR & rqcp_bit[mb]) == 0U)
 	{
 		if((HAL_GetTick() - t0) > 20U)
 		{
-			CAN->TSR = abrq_bit[mb];   /* abort: free the mailbox */
+			CAN1->TSR = abrq_bit[mb];   /* abort: free the mailbox */
 			stats.tx_fail++;
 			return 0U;
 		}
 	}
-	if((CAN->TSR & txok_bit[mb]) != 0U)
+	if((CAN1->TSR & txok_bit[mb]) != 0U)
 	{
 		stats.tx_ok++;
 		return 1U;
@@ -134,14 +134,14 @@ uint8_t can_bare_recv(uint32_t *std_id, uint8_t d[8])
 {
 	uint32_t rir, dl, dh;
 
-	if((CAN->RF0R & CAN_RF0R_FMP0) == 0U)
+	if((CAN1->RF0R & CAN_RF0R_FMP0) == 0U)
 	{
 		return 0U;
 	}
 
-	rir = CAN->sFIFOMailBox[0].RIR;
-	dl = CAN->sFIFOMailBox[0].RDLR;
-	dh = CAN->sFIFOMailBox[0].RDHR;
+	rir = CAN1->sFIFOMailBox[0].RIR;
+	dl = CAN1->sFIFOMailBox[0].RDLR;
+	dh = CAN1->sFIFOMailBox[0].RDHR;
 	d[0] = (uint8_t)(dl & 0xFFU);
 	d[1] = (uint8_t)((dl >> 8) & 0xFFU);
 	d[2] = (uint8_t)((dl >> 16) & 0xFFU);
@@ -152,15 +152,15 @@ uint8_t can_bare_recv(uint32_t *std_id, uint8_t d[8])
 	d[7] = (uint8_t)((dh >> 24) & 0xFFU);
 
 	*std_id = (rir >> CAN_RI0R_STID_Pos) & 0x7FFU;
-	CAN->RF0R |= CAN_RF0R_RFOM0;   /* release FIFO0 slot */
+	CAN1->RF0R |= CAN_RF0R_RFOM0;   /* release FIFO0 slot */
 	stats.rx_ok++;
 	return 1U;
 }
 
 void can_bare_stats(CanStats *out)
 {
-	stats.tec  = (uint8_t)((CAN->ESR >> 8) & 0xFFU);
-	stats.rec  = (uint8_t)((CAN->ESR >> 16) & 0xFFU);
-	stats.boff = (uint8_t)((CAN->ESR & CAN_ESR_BOFF) ? 1U : 0U);
+	stats.tec  = (uint8_t)((CAN1->ESR >> 8) & 0xFFU);
+	stats.rec  = (uint8_t)((CAN1->ESR >> 16) & 0xFFU);
+	stats.boff = (uint8_t)((CAN1->ESR & CAN_ESR_BOFF) ? 1U : 0U);
 	*out = stats;
 }
