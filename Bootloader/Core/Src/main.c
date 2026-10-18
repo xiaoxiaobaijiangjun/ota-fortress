@@ -13,6 +13,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "bootloader.h"
+#include "can_transport.h"
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -84,6 +86,19 @@ int main(void)
   {
     static const uint8_t boot_banner[] = "\r\nFOTA Bootloader v2.0 dual-slot (A/B) ready\r\n";
     HAL_UART_Transmit(BL_HOST_COMMUNICATION_UART, (uint8_t *)boot_banner, sizeof(boot_banner) - 1, HAL_MAX_DELAY);
+    /* C2 bring-up: self-report the CAN configuration so the bus side can be
+     * debugged from the UART evidence alone (mode / real clocks). */
+    {
+      char diag[96];
+      const char *mode = BL_CAN_LOOPBACK_TEST ? "LOOPBACK" : "NORMAL";
+      int n = snprintf(diag, sizeof(diag), "[BL] CAN selftest: mode=%s pclk1=%luHz\r\n",
+                       mode, HAL_RCC_GetPCLK1Freq());
+      if(n > 0)
+      {
+        HAL_UART_Transmit(BL_HOST_COMMUNICATION_UART, (uint8_t *)diag,
+                          (uint16_t)n, HAL_MAX_DELAY);
+      }
+    }
   }
 
   /* USER CODE END 2 */

@@ -7,6 +7,7 @@
  *****************************************************************************************************************************/
 
 #include <string.h>
+#include <stdio.h>
 #include "can_transport.h"
 #include "bootloader.h"
 #include "usart.h"
@@ -479,6 +480,25 @@ void BL_CAN_Init(void)
 	filt.FilterActivation = ENABLE;
 	(void)HAL_CAN_ConfigFilter(&hcan1, &filt);
 	(void)HAL_CAN_Start(&hcan1);
+
+	/* C2 bring-up self-test: transmit one frame on the response id. If this
+	 * completes, SOME node ACKed us (the master's CAN hardware) - the reverse
+	 * direction works. Report the verdict plus the raw registers over UART. */
+	{
+		uint8_t f[8] = {0xA1U, 0xA2U, 0U, 0U, 0U, 0U, 0U, 0U};
+		char line[112];
+		uint8_t ok = can_send_raw(BL_CAN_RSP_ID, f);
+		int n = snprintf(line, sizeof(line),
+			"[BL] CAN selftx=%s mcr=%08lX msr=%04lX btr=%08lX esr=%08lX\r\n",
+			ok ? "OK" : "FAIL",
+			(unsigned long)CAN1->MCR, (unsigned long)(CAN1->MSR & 0xFFFFU),
+			(unsigned long)CAN1->BTR, (unsigned long)CAN1->ESR);
+		if(n > 0)
+		{
+			(void)HAL_UART_Transmit(BL_HOST_COMMUNICATION_UART,
+				(uint8_t *)line, (uint16_t)n, HAL_MAX_DELAY);
+		}
+	}
 
 	can_rx_reset();
 }

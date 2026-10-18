@@ -19,7 +19,7 @@
 #include "bridge.h"
 
 #define KA_FAST_MS   300U
-#define KA_SLOW_MS   3000U
+#define KA_SLOW_MS   800U
 
 static void Error_Handler(void) { for(;;) {} }
 

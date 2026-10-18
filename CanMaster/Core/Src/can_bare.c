@@ -82,6 +82,31 @@ void can_bare_init(void)
 	}
 }
 
+void can_bare_set_timing(uint32_t brp, uint32_t ts1, uint32_t ts2)
+{
+	uint32_t t0;
+
+	CAN1->MCR |= CAN_MCR_INRQ;
+	t0 = HAL_GetTick();
+	while((CAN1->MSR & CAN_MSR_INAK) == 0U)
+	{
+		if((HAL_GetTick() - t0) > 10U)
+		{
+			return;
+		}
+	}
+	CAN1->BTR = ((0U) << 24) | (ts2 << 20) | (ts1 << 16) | brp;
+	CAN1->MCR &= ~CAN_MCR_INRQ;
+	t0 = HAL_GetTick();
+	while((CAN1->MSR & CAN_MSR_INAK) != 0U)
+	{
+		if((HAL_GetTick() - t0) > 10U)
+		{
+			return;
+		}
+	}
+}
+
 static const uint32_t abrq_bit[3] = {CAN_TSR_ABRQ0, CAN_TSR_ABRQ1, CAN_TSR_ABRQ2};
 static const uint32_t rqcp_bit[3] = {CAN_TSR_RQCP0, CAN_TSR_RQCP1, CAN_TSR_RQCP2};
 static const uint32_t txok_bit[3] = {CAN_TSR_TXOK0, CAN_TSR_TXOK1, CAN_TSR_TXOK2};
@@ -104,6 +129,14 @@ uint8_t can_bare_send(uint32_t std_id, const uint8_t d[8])
 		stats.tx_fail++;
 		return 0U;
 	}
+
+	/* RQCPx is write-1-clear and PERSISTS after a completed request: without
+	 * clearing, every wait after the first sees the STALE flag and returns the
+	 * STALE verdict instantly (found the hard way on the bench: frames were
+	 * being ACKed on the bus while the code reported failure). TXOK/ALST/TERR
+	 * clear together with RQCP. ABRQ is deliberately not written here - it is
+	 * an abort REQUEST and would kill the transmission we are about to start. */
+	CAN1->TSR = rqcp_bit[mb];
 
 	CAN1->sTxMailBox[mb].TDLR = (uint32_t)d[0] | ((uint32_t)d[1] << 8) | ((uint32_t)d[2] << 16) | ((uint32_t)d[3] << 24);
 	CAN1->sTxMailBox[mb].TDHR = (uint32_t)d[4] | ((uint32_t)d[5] << 8) | ((uint32_t)d[6] << 16) | ((uint32_t)d[7] << 24);
