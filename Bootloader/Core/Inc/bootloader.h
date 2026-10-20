@@ -1,6 +1,6 @@
 /*****************************************************************************************************************************
- * FOTA-STM32 Bootloader (STM32F407VET6 / Keil MDK port)
- * Based on: https://github.com/EhabMagdyy/FOTA-STM32
+ * ota-fortress Bootloader (STM32F407VET6 / Keil MDK port)
+ * Secondary development based on an upstream open-source FOTA project
  * Target MCU: STM32F407VET6 (512 KB Flash, 8 sectors, 128 KB SRAM)
  *****************************************************************************************************************************/
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-FOTA-STM32 Host Tool (dual-slot A/B)
+ota-fortress Host Tool (dual-slot A/B)
 ====================================
 
 Talks the FOTA bootloader protocol over a serial port (or an in-Python
@@ -38,7 +38,7 @@ Memory map (STM32F407VE, 512 KB flash):
     0x08040000  Slot B      (256 KB, sectors 6-7)
 
 The packet format and CRC-32/MPEG-2 match the STM32 bootloader and the
-original ESP32 sketch (EhabMagdyy/FOTA-STM32).
+upstream ESP32 sketch.
 """
 
 import argparse
@@ -1173,7 +1173,7 @@ def args_real_app():
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="FOTA-STM32 host tool (dual-slot A/B)")
+    parser = argparse.ArgumentParser(description="ota-fortress host tool (dual-slot A/B)")
     parser.add_argument("--port", default="COM5", help="serial port (e.g. COM5)")
     parser.add_argument("--baud", type=int, default=115200)
     parser.add_argument("--sim", action="store_true", help="use simulated bootloader instead of serial port")

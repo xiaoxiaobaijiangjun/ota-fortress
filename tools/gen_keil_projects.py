@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate the two Keil MDK (uVision) projects for the FOTA-STM32 resume project:
+Generate the Keil MDK (uVision) projects for ota-fortress:
   1. FOTA_Bootloader - custom bootloader at 0x08000000 (sectors 0-1)
   2. FOTA_App        - demo user application for slot A at 0x0800C000
                        (metadata occupies sector 2 at 0x08008000)
