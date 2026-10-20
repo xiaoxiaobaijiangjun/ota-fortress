@@ -10,7 +10,7 @@ Usage: python tools/canm_stats.py --port COM3
 import argparse
 import serial
 
-STATS_CMD = bytes([0x02, 0x5A])
+STATS_CMD = bytes([0x02, 0x5A, 0x00])   # LEN=2 -> [LEN][cmd][pad], parser waits for LEN+1 bytes
 
 
 def main() -> int:

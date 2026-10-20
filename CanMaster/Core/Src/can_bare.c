@@ -55,18 +55,40 @@ void can_bare_init(void)
 
 	CAN1->MCR = CAN_MCR_ABOM            /* auto bus-off recovery */
 	         | CAN_MCR_INRQ;           /* NART=0 -> auto retransmission */
+#if CANM_SNIFFER
+	/* identical bit timing as the master build (SP 88.9%). NORMAL mode but
+	 * the sniffer main loop never transmits: the node becomes a pure ACKer +
+	 * listener. With the borrowed 2nd transceiver RXD feeding PA11, this is
+	 * enough to close the loop: F407's selftest frame gets ACKed (TXOK on
+	 * its side) and lands intact in our FIFO. */
 	CAN1->BTR = ((0U) << 24)            /* SJW = 1 tq */
 	         | ((1U) << 20)            /* TS2 = 2 tq */
 	         | ((14U) << 16)           /* TS1 = 15 tq */
 	         | (3U);                   /* BRP = 4  -> 36/4 = 9 MHz, 18 tq = 500 kbps */
+#else
+	CAN1->BTR = ((0U) << 24)            /* SJW = 1 tq */
+	         | ((1U) << 20)            /* TS2 = 2 tq */
+	         | ((14U) << 16)           /* TS1 = 15 tq */
+	         | (3U);                   /* BRP = 4  -> 36/4 = 9 MHz, 18 tq = 500 kbps */
+#endif
 
-	/* filter bank 0: 16-bit id list, accept only 0x6E1 into FIFO0 */
+	/* filter bank 0 */
 	CAN1->FMR |= CAN_FMR_FINIT;
+#if CANM_SNIFFER
+	/* 32-bit mask mode, mask = 0: accept EVERYTHING into FIFO0 - the point is
+	 * to see whatever actually shows up on the wire, at any id */
+	CAN1->FM1R &= ~CAN_FM1R_FBM0;
+	CAN1->FS1R |= CAN_FS1R_FSC0;
+	CAN1->FFA1R &= ~CAN_FFA1R_FFA0;
+	CAN1->sFilterRegister[0].FR1 = 0U;
+	CAN1->sFilterRegister[0].FR2 = 0U;
+#else
 	CAN1->FM1R |= CAN_FM1R_FBM0;                       /* list mode */
 	CAN1->FS1R &= ~CAN_FS1R_FSC0;                      /* 16-bit scale */
 	CAN1->FFA1R &= ~CAN_FFA1R_FFA0;                     /* FIFO0 */
 	CAN1->sFilterRegister[0].FR1 = ((uint32_t)(CANM_RSP_ID << 5) << 16) | (uint32_t)(CANM_RSP_ID << 5);
 	CAN1->sFilterRegister[0].FR2 = ((uint32_t)(CANM_RSP_ID << 5) << 16) | (uint32_t)(CANM_RSP_ID << 5);
+#endif
 	CAN1->FA1R |= CAN_FA1R_FACT0;
 	CAN1->FMR &= ~CAN_FMR_FINIT;
 
@@ -80,7 +102,34 @@ void can_bare_init(void)
 			return;
 		}
 	}
+#if CANM_SNIFFER
+	CAN1->ESR = CAN_ESR_LEC;   /* discard the reset-time LEC=0 fake event */
+#endif
 }
+
+#if CANM_SNIFFER
+/* PA11 raw-level sampler: counts LOW samples of the CAN_RX pin straight from
+ * the GPIO data register, bypassing bxCAN. During the F407 retransmission
+ * storm a live RX path must show LOWs (dominant ~40% of each frame); all-HIGH
+ * means the signal dies before the pin: TJA1 receive side or its wire. */
+static uint32_t pa11_low;
+static uint32_t pa11_tot;
+
+void can_bare_pa11_poll(void)
+{
+	pa11_tot++;
+	if((GPIOA->IDR & (1UL << 11)) == 0U)
+	{
+		pa11_low++;
+	}
+}
+
+void can_bare_pa11_get(uint32_t *low, uint32_t *tot)
+{
+	*low = pa11_low;
+	*tot = pa11_tot;
+}
+#endif
 
 void can_bare_set_timing(uint32_t brp, uint32_t ts1, uint32_t ts2)
 {
@@ -197,3 +246,26 @@ void can_bare_stats(CanStats *out)
 	stats.boff = (uint8_t)((CAN1->ESR & CAN_ESR_BOFF) ? 1U : 0U);
 	*out = stats;
 }
+
+#if CANM_SNIFFER
+static uint32_t lec_cnt[7];
+
+void can_bare_lec_poll(void)
+{
+	uint32_t lec = (CAN1->ESR & CAN_ESR_LEC) >> CAN_ESR_LEC_Pos;
+	if(lec != 7U)
+	{
+		lec_cnt[lec]++;
+		CAN1->ESR = CAN_ESR_LEC;   /* 111 = re-arm for the next event */
+	}
+}
+
+void can_bare_lec_get(uint32_t cnt[7])
+{
+	uint8_t i;
+	for(i = 0U; i < 7U; i++)
+	{
+		cnt[i] = lec_cnt[i];
+	}
+}
+#endif

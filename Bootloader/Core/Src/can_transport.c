@@ -429,6 +429,26 @@ uint8_t BL_CAN_Inject_And_Service(const uint8_t *frame8)
 	return 1U;
 }
 
+/* Init dead-end: the peripheral never came up (clock / INAK trouble). Say so on
+ * the UART (if attached) and hold PE9 dark forever - a dark LED right after
+ * reset means this branch, distinguishable from every selftest pattern. */
+static void BL_CAN_Init_Failed(const char *where)
+{
+	char line[80];
+	int n = snprintf(line, sizeof(line),
+		"[BL] CAN init FAILED at %s mcr=%08lX msr=%04lX\r\n",
+		where, (unsigned long)CAN1->MCR, (unsigned long)(CAN1->MSR & 0xFFFFU));
+	if(n > 0)
+	{
+		(void)HAL_UART_Transmit(BL_HOST_COMMUNICATION_UART,
+			(uint8_t *)line, (uint16_t)n, HAL_MAX_DELAY);
+	}
+	for(;;)
+	{
+		BL_IWDG_Refresh();
+	}
+}
+
 void BL_CAN_Init(void)
 {
 	GPIO_InitTypeDef gpio = {0};
@@ -438,6 +458,15 @@ void BL_CAN_Init(void)
 	 * cycles - HAL_GetTick is unreliable across flash-erase stalls. */
 	CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
 	DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+	/* PE9 verdict LED, configured FIRST so every failure branch below can
+	 * use it. Patterns are symmetric toggles, polarity does not matter. */
+	__HAL_RCC_GPIOE_CLK_ENABLE();
+	gpio.Pin = GPIO_PIN_9;
+	gpio.Mode = GPIO_MODE_OUTPUT_PP;
+	gpio.Speed = GPIO_SPEED_FREQ_LOW;
+	HAL_GPIO_Init(GPIOE, &gpio);
+	HAL_GPIO_WritePin(GPIOE, GPIO_PIN_9, GPIO_PIN_RESET);
 
 	/* PB8 = CAN1_RX, PB9 = CAN1_TX (AF9). Chosen to keep PA11/PA12 (USB)
 	 * free - see the project plan. */
@@ -464,6 +493,7 @@ void BL_CAN_Init(void)
 	hcan1.Init.TransmitFifoPriority = DISABLE;
 	if(HAL_CAN_Init(&hcan1) != HAL_OK)
 	{
+		BL_CAN_Init_Failed("HAL_CAN_Init");
 		return;
 	}
 
@@ -479,25 +509,109 @@ void BL_CAN_Init(void)
 	filt.FilterFIFOAssignment = CAN_RX_FIFO0;
 	filt.FilterActivation = ENABLE;
 	(void)HAL_CAN_ConfigFilter(&hcan1, &filt);
-	(void)HAL_CAN_Start(&hcan1);
+	if(HAL_CAN_Start(&hcan1) != HAL_OK)
+	{
+		BL_CAN_Init_Failed("HAL_CAN_Start");
+		return;
+	}
 
-	/* C2 bring-up self-test: transmit one frame on the response id. If this
-	 * completes, SOME node ACKed us (the master's CAN hardware) - the reverse
-	 * direction works. Report the verdict plus the raw registers over UART. */
+	/* C2 bring-up self-test: transmit one frame on the response id and watch
+	 * what the hardware says about it. AddTxMessage returning HAL_OK only
+	 * means the mailbox took the frame; with auto-retransmission ON and no
+	 * ACKer on the bus, RQCP never comes - the REAL verdict is the LEC:
+	 *   LEC=3 (ACK)   frame reached the wire intact, nobody answered ->
+	 *                  this node's TX path is fine; blame the link or peer
+	 *   LEC=4/5 (bit) a transmitted dominant bit did not read back ->
+	 *                  TX path broken before the bus (PB9 wire / transceiver)
+	 *   TXOK          somebody ACKed us - impossible from a silent F103,
+	 *                  so this means a loopback-class mode error (see BTR)
+	 * Verdict lands on PE9 (the JDY-31 tunnel may or may not be attached):
+	 *   1 Hz square   = LEC 3 (on the bus, unACKed)
+	 *   double-blink  = LEC 4/5 (TX path broken)
+	 *   10 Hz flicker = TXOK (unexpected: mode trouble)
+	 *   dark          = init/start failed (never transmitted) */
 	{
 		uint8_t f[8] = {0xA1U, 0xA2U, 0U, 0U, 0U, 0U, 0U, 0U};
-		char line[112];
-		uint8_t ok = can_send_raw(BL_CAN_RSP_ID, f);
-		int n = snprintf(line, sizeof(line),
-			"[BL] CAN selftx=%s mcr=%08lX msr=%04lX btr=%08lX esr=%08lX\r\n",
-			ok ? "OK" : "FAIL",
-			(unsigned long)CAN1->MCR, (unsigned long)(CAN1->MSR & 0xFFFFU),
-			(unsigned long)CAN1->BTR, (unsigned long)CAN1->ESR);
-		if(n > 0)
+		char line[128];
+		uint8_t queued;
+		uint8_t txok = 0U;
+		uint32_t lec_hist[8] = {0};
+		uint32_t t0 = HAL_GetTick();
+		uint32_t tsr = 0U;
+		uint32_t pattern;   /* 0=flicker 1=1Hz 2=double 3=dark */
+		uint32_t i;
+
+		queued = can_send_raw(BL_CAN_RSP_ID, f);
+		for(;;)
 		{
-			(void)HAL_UART_Transmit(BL_HOST_COMMUNICATION_UART,
-				(uint8_t *)line, (uint16_t)n, HAL_MAX_DELAY);
+			uint32_t lec = (CAN1->ESR & CAN_ESR_LEC) >> CAN_ESR_LEC_Pos;
+			if(lec != 7U)
+			{
+				lec_hist[lec]++;
+				CAN1->ESR = CAN_ESR_LEC;   /* 111 = re-arm */
+			}
+			tsr = CAN1->TSR;
+			if((tsr & CAN_TSR_RQCP0) != 0U)
+			{
+				txok = ((tsr & CAN_TSR_TXOK0) != 0U) ? 1U : 0U;
+				break;
+			}
+			if((HAL_GetTick() - t0) > 500U)
+			{
+				break;   /* unACKed retransmission: expected on a dead bus */
+			}
 		}
+		if(queued == 0U)
+		{
+			pattern = 3U;
+		}
+		else if(txok != 0U)
+		{
+			pattern = 0U;
+		}
+		else if((lec_hist[3] != 0U) && (lec_hist[4] == 0U) && (lec_hist[5] == 0U))
+		{
+			pattern = 1U;
+		}
+		else if((lec_hist[4] != 0U) || (lec_hist[5] != 0U))
+		{
+			pattern = 2U;
+		}
+		else
+		{
+			pattern = 3U;   /* queued, no completion, no LEC at all: wedged */
+		}
+
+		{
+			int n = snprintf(line, sizeof(line),
+				"[BL] CAN selftx q=%u ok=%u lec=%lu,%lu,%lu,%lu,%lu,%lu mcr=%08lX msr=%04lX btr=%08lX esr=%08lX tsr=%08lX\r\n",
+				queued, txok,
+				(unsigned long)lec_hist[0], (unsigned long)lec_hist[1],
+				(unsigned long)lec_hist[2], (unsigned long)lec_hist[3],
+				(unsigned long)lec_hist[4], (unsigned long)lec_hist[5],
+				(unsigned long)CAN1->MCR, (unsigned long)(CAN1->MSR & 0xFFFFU),
+				(unsigned long)CAN1->BTR, (unsigned long)CAN1->ESR,
+				(unsigned long)tsr);
+			if(n > 0)
+			{
+				(void)HAL_UART_Transmit(BL_HOST_COMMUNICATION_UART,
+					(uint8_t *)line, (uint16_t)n, HAL_MAX_DELAY);
+			}
+		}
+
+		/* hold the pattern ~4 s for a human, keep a leftover IWDG fed */
+		for(i = 0U; i < 200U; i++)
+		{
+			uint32_t ms = i * 20U;
+			uint32_t on = 0U;
+			if(pattern == 0U)      { on = ((ms / 50U) & 1U); }
+			else if(pattern == 1U) { on = ((ms / 500U) & 1U); }
+			else if(pattern == 2U) { on = ((ms % 1000U) < 200U) && (((ms / 100U) & 1U) == 0U); }
+			HAL_GPIO_WritePin(GPIOE, GPIO_PIN_9, on ? GPIO_PIN_SET : GPIO_PIN_RESET);
+			HAL_Delay(20U);
+			BL_IWDG_Refresh();
+		}
+		HAL_GPIO_WritePin(GPIOE, GPIO_PIN_9, GPIO_PIN_RESET);
 	}
 
 	can_rx_reset();
