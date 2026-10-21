@@ -47,9 +47,9 @@ typedef struct
     uint8_t  state;        /* META_STATE_* */
     uint8_t  reserved;
     uint32_t image_len;    /* length of the image in the active slot (bytes) */
-    uint32_t image_crc;    /* FOTA CRC32 of that image */
+    uint32_t image_crc;    /* CRC-32/MPEG-2 of that image */
     uint32_t min_sv;       /* anti-rollback floor: highest activated security_version */
-    uint32_t meta_crc;     /* FOTA CRC32 of the META_CRC_COVERED_LEN bytes above */
+    uint32_t meta_crc;     /* CRC-32/MPEG-2 of the META_CRC_COVERED_LEN bytes above */
 } FOTA_Meta_t;
 
 /* Layout check: 4+1+1+1+1+4+4+4+4+4 = 24 bytes, no padding on ARM */

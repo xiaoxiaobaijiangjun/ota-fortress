@@ -6,7 +6,7 @@ ota-fortress Host Tool (dual-slot A/B)
 
 Talks the FOTA bootloader protocol over a serial port (or an in-Python
 simulated STM32) so the whole update chain can be demonstrated without
-an ESP32, Firebase or Node-RED:
+hardware:
 
     python fota_host.py --port COM5 status
     python fota_host.py --port COM5 --slot B erase
@@ -37,8 +37,8 @@ Memory map (STM32F407VE, 512 KB flash):
     0x0800C000  Slot A      (208 KB, sectors 3-5)
     0x08040000  Slot B      (256 KB, sectors 6-7)
 
-The packet format and CRC-32/MPEG-2 match the STM32 bootloader and the
-upstream ESP32 sketch.
+The packet format and the CRC-32/MPEG-2 used for every packet, the
+metadata record and whole-image verification match the STM32 bootloader.
 """
 
 import argparse
@@ -148,22 +148,22 @@ def slot_range(slot):
 
 
 # ---------------------------------------------------------------------------
-# FOTA CRC32 - bitwise implementation identical to the original ESP32 sketch
-# (init 0xFFFFFFFF, poly 0x04C11DB7, byte XORed into the low byte, 32 shifts,
-# no reflection, no final XOR).
+# CRC-32/MPEG-2 - bitwise reference implementation
+# (init 0xFFFFFFFF, poly 0x04C11DB7, byte XORed into the high byte, 8 shifts,
+# no reflection, no final XOR). Standard check value: "123456789" -> 0x0376E6E7.
 #
-# This is NOT the standard CRC-32/MPEG-2; it is the algorithm produced by the
-# STM32 hardware CRC peripheral when HAL_CRC_Accumulate() is fed one byte per
-# 32-bit word with default settings. Both sides were verified numerically:
-#   esp32_sketch_crc("123456789") == stm32_hw_model("123456789")
-#                                 == 0x1556F485
+# The MCU side computes the same value with the STM32 CRC hardware peripheral:
+# the F4 unit is word-oriented, so bytes are packed into big-endian 32-bit
+# words and fed via HAL_CRC_Accumulate(); a 0-3 byte tail (packet lengths are
+# rarely multiples of 4) is finished in software. _stm32_hw_crc_model() below
+# mirrors that driver bit by bit and the selftest asserts both sides equal.
 # ---------------------------------------------------------------------------
-def crc32_fota(data: bytes) -> int:
+def crc32_mpeg2(data: bytes) -> int:
     crc = 0xFFFFFFFF
     poly = 0x04C11DB7
     for byte in data:
-        crc ^= byte
-        for _ in range(32):
+        crc ^= byte << 24
+        for _ in range(8):
             if crc & 0x80000000:
                 crc = ((crc << 1) ^ poly) & 0xFFFFFFFF
             else:
@@ -172,15 +172,25 @@ def crc32_fota(data: bytes) -> int:
 
 
 def _stm32_hw_crc_model(data: bytes) -> int:
-    """Model of the STM32 CRC peripheral (RM0090): one 32-bit word per byte,
-    MSB-first bit processing, no reversal, init 0xFFFFFFFF, poly 0x04C11DB7."""
+    """Model of the STM32 CRC peripheral as used by the bootloader (RM0090):
+    full 4-byte groups as big-endian 32-bit words, MSB-first, no reversal,
+    init 0xFFFFFFFF, poly 0x04C11DB7; the 0-3 byte tail bitwise."""
     poly = 0x04C11DB7
     crc = 0xFFFFFFFF
-    for byte in data:
-        word = byte
-        for i in range(31, -1, -1):
-            feedback = ((word >> i) & 1) ^ ((crc >> 31) & 1)
+    words = len(data) // 4
+    for i in range(words):
+        word = ((data[4 * i] << 24) | (data[4 * i + 1] << 16)
+                | (data[4 * i + 2] << 8) | data[4 * i + 3])
+        for bit in range(31, -1, -1):
+            feedback = ((word >> bit) & 1) ^ ((crc >> 31) & 1)
             crc = ((crc << 1) ^ (poly if feedback else 0)) & 0xFFFFFFFF
+    for byte in data[words * 4:]:
+        crc ^= byte << 24
+        for _ in range(8):
+            if crc & 0x80000000:
+                crc = ((crc << 1) ^ poly) & 0xFFFFFFFF
+            else:
+                crc = (crc << 1) & 0xFFFFFFFF
     return crc
 
 
@@ -191,7 +201,7 @@ def meta_pack(active, state, image_len=0, image_crc=0, min_sv=0) -> bytes:
     """Serialize FOTA_Meta_t exactly like the C struct (24 bytes, v2)."""
     head = struct.pack("<IBBBB", META_MAGIC, META_VERSION, active, state, 0)
     tail = struct.pack("<III", image_len, image_crc, min_sv)
-    return head + tail + struct.pack("<I", crc32_fota(head + tail))
+    return head + tail + struct.pack("<I", crc32_mpeg2(head + tail))
 
 
 def meta_unpack(raw: bytes):
@@ -200,7 +210,7 @@ def meta_unpack(raw: bytes):
     magic, version, active, state, res, image_len, image_crc, min_sv, meta_crc = struct.unpack("<IBBBBIIII", raw)
     if magic != META_MAGIC or version != META_VERSION:
         return None
-    if crc32_fota(raw[:20]) != meta_crc:
+    if crc32_mpeg2(raw[:20]) != meta_crc:
         return None
     return dict(active=active, state=state, image_len=image_len, image_crc=image_crc, min_sv=min_sv)
 
@@ -211,7 +221,7 @@ def meta_unpack(raw: bytes):
 def simple_cmd(command: int) -> bytes:
     """[5][cmd][crc32 over first 2 bytes, little-endian]"""
     head = bytes([5, command])
-    return head + struct.pack("<I", crc32_fota(head))
+    return head + struct.pack("<I", crc32_mpeg2(head))
 
 
 def write_cmd(address: int, payload: bytes) -> bytes:
@@ -219,19 +229,19 @@ def write_cmd(address: int, payload: bytes) -> bytes:
     assert len(payload) == CHUNK_SIZE
     head = bytes([74, CMD_WRITE]) + struct.pack("<I", address) + bytes([CHUNK_SIZE])
     body = head + payload
-    return body + struct.pack("<I", crc32_fota(body))
+    return body + struct.pack("<I", crc32_mpeg2(body))
 
 
 def erase_slot_cmd(slot: int) -> bytes:
     """[6][0x16][slot][crc32 over first 3 bytes]"""
     head = bytes([6, CMD_ERASE_SLOT, slot])
-    return head + struct.pack("<I", crc32_fota(head))
+    return head + struct.pack("<I", crc32_mpeg2(head))
 
 
 def activate_cmd(slot: int, image_len: int, image_crc: int) -> bytes:
     """[14][0x17][slot][image_len LE32][image_crc LE32][crc32 over first 11 bytes]"""
     head = bytes([14, CMD_ACTIVATE, slot]) + struct.pack("<II", image_len, image_crc)
-    return head + struct.pack("<I", crc32_fota(head))
+    return head + struct.pack("<I", crc32_mpeg2(head))
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +305,7 @@ class CanBridgeTransport:
     @staticmethod
     def _tunnel_packet(cmd: int, frame: bytes) -> bytes:
         head = bytes([13, cmd]) + frame
-        return head + struct.pack("<I", crc32_fota(head))
+        return head + struct.pack("<I", crc32_mpeg2(head))
 
     def _send_frame(self, frame: bytes) -> None:
         # The MCU services the injected frame synchronously (CAN round trip
@@ -321,7 +331,7 @@ class CanBridgeTransport:
                 return
             pkt = bytes(self._buf[: length + 1])
             del self._buf[: length + 1]
-            if crc32_fota(pkt[:-4]) != struct.unpack("<I", pkt[-4:])[0]:
+            if crc32_mpeg2(pkt[:-4]) != struct.unpack("<I", pkt[-4:])[0]:
                 continue
             if pkt[1] == 0x1D:
                 self._rx.feed(pkt[2:10])
@@ -492,7 +502,7 @@ class SimulatedSTM32:
         meta = self._meta_read()
         if meta and meta["active"] == slot and 8 <= meta["image_len"] <= (end - base):
             idx = base - 0x08000000
-            calc = crc32_fota(bytes(self.flash[idx : idx + meta["image_len"]]))
+            calc = crc32_mpeg2(bytes(self.flash[idx : idx + meta["image_len"]]))
             return calc == meta["image_crc"]
         return True
 
@@ -507,7 +517,7 @@ class SimulatedSTM32:
     # -- protocol handlers --------------------------------------------------
     def _check_crc(self, packet: bytes) -> bool:
         host_crc = struct.unpack("<I", packet[-4:])[0]
-        return crc32_fota(packet[:-4]) == host_crc
+        return crc32_mpeg2(packet[:-4]) == host_crc
 
     def _handle(self, packet: bytes) -> None:
         if len(packet) < 2 or packet[0] != len(packet) - 1:
@@ -590,7 +600,7 @@ class SimulatedSTM32:
                 base, size = slot_range(slot)
                 if 8 <= image_len <= size and self._app_valid(base, base + size):
                     idx = base - 0x08000000
-                    calc = crc32_fota(bytes(self.flash[idx : idx + image_len]))
+                    calc = crc32_mpeg2(bytes(self.flash[idx : idx + image_len]))
                     if calc == image_crc:
                         status, sv = self._verify_signed(idx, image_len)
                         if status == 0x01 and sv < self.min_sv:
@@ -723,7 +733,7 @@ class FOTAClient:
         base, size = slot_range(slot)
         if len(firmware) > size:
             raise RuntimeError(f"firmware too large: {len(firmware)} > {size} bytes")
-        # pad last chunk with 0xFF like the ESP32 path does
+        # pad the last chunk with 0xFF so every write is a full 64-byte block
         padded = firmware + b"\xFF" * ((CHUNK_SIZE - len(firmware) % CHUNK_SIZE) % CHUNK_SIZE)
         chunks = len(padded) // CHUNK_SIZE
         for i in range(chunks):
@@ -756,7 +766,7 @@ class FOTAClient:
         ok, why = self._image_ok_for_slot(fw.image, slot)
         if not ok:
             return f"Activate Refused: {why}"
-        packet = activate_cmd(slot, len(fw.image), crc32_fota(fw.image))
+        packet = activate_cmd(slot, len(fw.image), crc32_mpeg2(fw.image))
         if isinstance(self.t, CanBridgeTransport):
             # CAN-bridge special case: the success reply byte's loopback
             # echo strands in the CAN FIFO (the app jump happens inside the
@@ -908,10 +918,14 @@ def run_selftest() -> int:
     print("== FOTA dual-slot protocol self-test (simulated STM32) ==")
 
     # 1) CRC known answer + equivalence with the STM32 CRC hardware model
-    assert crc32_fota(b"123456789") == 0x1556F485, "CRC vector mismatch"
-    assert crc32_fota(b"123456789") == _stm32_hw_crc_model(b"123456789")
-    print("[PASS] FOTA CRC32 vector 123456789 -> 0x1556F485")
-    print("[PASS] software CRC == STM32 hardware CRC model")
+    assert crc32_mpeg2(b"123456789") == 0x0376E6E7, "CRC vector mismatch"
+    assert crc32_mpeg2(b"123456789") == _stm32_hw_crc_model(b"123456789")
+    for probe in (b"", b"\x05", b"\x05\x10", b"\x06\x16\x00",
+                  b"\x0e\x17\x00\x00\x00\x00", b"123456789"):
+        # packet heads (2/3/5/11 bytes) exercise the hardware-model tail path
+        assert crc32_mpeg2(probe) == _stm32_hw_crc_model(probe), probe
+    print("[PASS] CRC-32/MPEG-2 vector 123456789 -> 0x0376E6E7")
+    print("[PASS] software CRC == STM32 hardware CRC model (incl. <4B tails)")
 
     # 2) metadata pack/unpack round trip (v2: 24 bytes with min_sv)
     raw = meta_pack(SLOT_A, META_STATE_TRIAL, 700, 0x12345678)
@@ -1224,7 +1238,7 @@ def main() -> int:
             print("usage: fota_host.py crc <file.bin>")
             return 2
         data = open(args.file, "rb").read()
-        print(f"FOTA CRC32: 0x{crc32_fota(data):08X}")
+        print(f"CRC-32/MPEG-2: 0x{crc32_mpeg2(data):08X}")
         return 0
     if args.command is None:
         parser.print_help()

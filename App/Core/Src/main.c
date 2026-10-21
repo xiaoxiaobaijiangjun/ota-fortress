@@ -28,7 +28,7 @@
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void APP_UART_Send_String(const char *str);
-static uint32_t APP_CRC32_FOTA(const uint8_t *data, uint32_t len);
+static uint32_t APP_CRC32_MPEG2(const uint8_t *data, uint32_t len);
 static uint8_t APP_Meta_Read(FOTA_Meta_t *meta);
 static void APP_Meta_Confirm_Slot(void);
 static void APP_Check_Reboot_Request(void);
@@ -148,11 +148,13 @@ static void APP_UART_Send_String(const char *str)
 }
 
 /**
- * @brief FOTA CRC32 - identical algorithm to the HOST and the STM32 hardware
- *        CRC peripheral (byte fed as a 32-bit word, MSB-first, no reflection).
+ * @brief CRC-32/MPEG-2 (poly 0x04C11DB7, init 0xFFFFFFFF, byte XORed into
+ *        the high byte, 8 shifts, no reflection, no final XOR) - identical
+ *        algorithm to the HOST and the bootloader (which feeds the same
+ *        stream to the hardware CRC unit as big-endian words).
  *        Used here to validate the metadata sector written by the bootloader.
  */
-static uint32_t APP_CRC32_FOTA(const uint8_t *data, uint32_t len)
+static uint32_t APP_CRC32_MPEG2(const uint8_t *data, uint32_t len)
 {
   uint32_t crc = 0xFFFFFFFFUL;
   const uint32_t poly = 0x04C11DB7UL;
@@ -161,8 +163,8 @@ static uint32_t APP_CRC32_FOTA(const uint8_t *data, uint32_t len)
 
   for (i = 0; i < len; i++)
   {
-    crc ^= data[i];
-    for (b = 0; b < 32; b++)
+    crc ^= (uint32_t)data[i] << 24;
+    for (b = 0; b < 8; b++)
     {
       if (crc & 0x80000000UL)
       {
@@ -193,7 +195,7 @@ static uint8_t APP_Meta_Read(FOTA_Meta_t *meta)
   {
     return 0;
   }
-  return (APP_CRC32_FOTA(p, META_CRC_COVERED_LEN) == meta->meta_crc);
+  return (APP_CRC32_MPEG2(p, META_CRC_COVERED_LEN) == meta->meta_crc);
 }
 
 /**
@@ -221,7 +223,7 @@ static void APP_Meta_Confirm_Slot(void)
   /* min_sv (anti-rollback floor) is carried over untouched: the app only
    * confirms the TRIAL state, it must never raise or lower the floor. */
   meta.state = META_STATE_IDLE;
-  meta.meta_crc = APP_CRC32_FOTA((const uint8_t *)&meta, META_CRC_COVERED_LEN);
+  meta.meta_crc = APP_CRC32_MPEG2((const uint8_t *)&meta, META_CRC_COVERED_LEN);
 
   HAL_FLASH_Unlock();
   EraseInit.TypeErase = FLASH_TYPEERASE_SECTORS;

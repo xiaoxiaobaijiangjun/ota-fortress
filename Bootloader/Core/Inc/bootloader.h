@@ -9,7 +9,7 @@
 
 #include <stdint.h>
 
-/* Communication peripheral used to talk with the HOST (ESP32 or PC) */
+/* Communication peripheral used to talk with the HOST (PC host tool) */
 #define BL_HOST_COMMUNICATION_UART       &huart1
 #define CRC_ENGINE_OBJ                   &hcrc
 

@@ -1025,19 +1025,37 @@ uint8_t Bootloader_CRC_Verify(uint8_t *pData, uint32_t Data_Len, uint32_t Host_C
 
 uint32_t Bootloader_CRC_Calculate(const uint8_t *pData, uint32_t Data_Len)
 {
-	uint32_t MCU_CRC_Calculated = 0;
+	uint32_t MCU_CRC_Calculated = 0xFFFFFFFF;
 	uint32_t Data_Buffer = 0;
 	uint32_t Data_Counter = 0;
+	uint32_t Word_Count = Data_Len / 4U;
+	uint8_t  Bit_Counter = 0;
 
-	/* Calculate CRC32 (byte fed as a 32-bit word, matches the HOST software
-	 * implementation and the original ESP32 sketch) */
+	/* CRC-32/MPEG-2 (poly 0x04C11DB7, init 0xFFFFFFFF, no reflection, no
+	 * final XOR). The CRC unit is word-oriented, so full 4-byte groups are
+	 * packed into big-endian words (packed bytewise: the buffer may be
+	 * unaligned) and fed through the hardware; the 0-3 byte tail is finished
+	 * in software. Standard check value: "123456789" -> 0x0376E6E7. */
 	__HAL_CRC_DR_RESET(CRC_ENGINE_OBJ);
-	for(Data_Counter = 0; Data_Counter < Data_Len; Data_Counter++){
-		Data_Buffer = (uint32_t)pData[Data_Counter];
+	for(Data_Counter = 0; Data_Counter < Word_Count; Data_Counter++){
+		Data_Buffer = ((uint32_t)pData[4U * Data_Counter] << 24) |
+		              ((uint32_t)pData[4U * Data_Counter + 1U] << 16) |
+		              ((uint32_t)pData[4U * Data_Counter + 2U] << 8) |
+		              (uint32_t)pData[4U * Data_Counter + 3U];
 		MCU_CRC_Calculated = HAL_CRC_Accumulate(CRC_ENGINE_OBJ, &Data_Buffer, 1);
 	}
 	/* Reset the CRC Calculation Unit */
 	__HAL_CRC_DR_RESET(CRC_ENGINE_OBJ);
+	for(Data_Counter = Word_Count * 4U; Data_Counter < Data_Len; Data_Counter++){
+		MCU_CRC_Calculated ^= (uint32_t)pData[Data_Counter] << 24;
+		for(Bit_Counter = 0; Bit_Counter < 8; Bit_Counter++){
+			if(MCU_CRC_Calculated & 0x80000000U){
+				MCU_CRC_Calculated = (MCU_CRC_Calculated << 1) ^ 0x04C11DB7U;
+			}else{
+				MCU_CRC_Calculated = (MCU_CRC_Calculated << 1);
+			}
+		}
+	}
 	return MCU_CRC_Calculated;
 }
 
